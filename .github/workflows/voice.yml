@@ -64,7 +64,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build build
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # CUDA 13 的 cuBLAS DLL 在 bin\x64（不在 PATH 上，exe 起不来）
+          if ('${{ matrix.backend }}' -eq 'cuda') { $env:PATH = "$env:CUDA_PATH\bin\x64;$env:CUDA_PATH\bin;$env:PATH" }
           .\build\bin\friday-voice.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 打包
         shell: pwsh
         run: |

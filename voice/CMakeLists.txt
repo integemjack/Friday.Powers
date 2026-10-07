@@ -1,0 +1,112 @@
+# friday-voice：本地 GPU 实时语音（Friday 的 Power）
+#
+# 一个可执行文件：ggml（CUDA / Vulkan / Metal / OpenCL / CPU 静态链进来）+ SenseVoice 识别 + FSMN-VAD + HTTP/WebSocket 服务。
+# 模型不打进文件，运行时由 --model / --vad 指定（Friday 负责下载）。
+#
+#   cmake -B build -G Ninja -DVOICE_CUDA=ON          # 或 -DVOICE_VULKAN=ON，可同时开
+#   cmake --build build                               # 产物 build/bin/friday-voice
+cmake_minimum_required(VERSION 3.24)
+project(friday-voice VERSION 0.1.0 LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+endif()
+if(MSVC)
+    # 单文件：静态 C/C++ 运行库，不依赖 VC 运行库 DLL
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>")
+    add_compile_definitions(NOMINMAX _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN)
+endif()
+
+option(VOICE_CUDA   "CUDA 后端（NVIDIA）" OFF)
+option(VOICE_VULKAN "Vulkan 后端（NVIDIA / AMD / Intel / Adreno）" OFF)
+option(VOICE_METAL  "Metal 后端（Apple）" OFF)
+option(VOICE_OPENCL "OpenCL 后端（Adreno 等）" OFF)
+
+# ── ggml：静态、所有后端编进同一个文件 ──
+set(BUILD_SHARED_LIBS   OFF CACHE BOOL "" FORCE)
+set(GGML_BACKEND_DL     OFF CACHE BOOL "" FORCE)
+set(GGML_NATIVE         OFF CACHE BOOL "")          # 默认可移植；本机调试可 -DGGML_NATIVE=ON
+set(GGML_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(GGML_CUDA   ${VOICE_CUDA}   CACHE BOOL "" FORCE)
+set(GGML_VULKAN ${VOICE_VULKAN} CACHE BOOL "" FORCE)
+set(GGML_METAL  ${VOICE_METAL}  CACHE BOOL "" FORCE)
+set(GGML_OPENCL ${VOICE_OPENCL} CACHE BOOL "" FORCE)
+if(VOICE_METAL)
+    set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)
+endif()
+if(VOICE_CUDA)
+    set(GGML_CUDA_NO_VMM ON CACHE BOOL "" FORCE)     # 不直接依赖 libcuda 的 VMM 接口
+endif()
+
+include(FetchContent)
+FetchContent_Declare(ggml
+    URL https://github.com/ggml-org/ggml/archive/refs/tags/v0.26.0.tar.gz
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_Declare(civetweb
+    URL https://github.com/civetweb/civetweb/archive/refs/tags/v1.16.zip
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(ggml)
+FetchContent_GetProperties(civetweb)
+if(NOT civetweb_POPULATED)
+    if(POLICY CMP0169)
+        cmake_policy(SET CMP0169 OLD)
+    endif()
+    FetchContent_Populate(civetweb)       # 只要 civetweb.c，不走它自己的 CMake（会编测试、SSL）
+endif()
+
+# 单头文件依赖：json.hpp（nlohmann/json 3.12.0）、miniaudio.h（0.11.25，只用解码和重采样）
+set(VOICE_HEADER_DIR ${CMAKE_BINARY_DIR}/_deps/headers)
+foreach(spec
+        "json.hpp|https://github.com/nlohmann/json/releases/download/v3.12.0/json.hpp"
+        "miniaudio.h|https://raw.githubusercontent.com/mackron/miniaudio/0.11.25/miniaudio.h")
+    string(REPLACE "|" ";" parts "${spec}")
+    list(GET parts 0 name)
+    list(GET parts 1 url)
+    if(NOT EXISTS ${VOICE_HEADER_DIR}/${name})
+        file(DOWNLOAD ${url} ${VOICE_HEADER_DIR}/${name} STATUS st TLS_VERIFY ON)
+        list(GET st 0 code)
+        if(NOT code EQUAL 0)
+            file(REMOVE ${VOICE_HEADER_DIR}/${name})
+            message(FATAL_ERROR "下载 ${name} 失败：${st}")
+        endif()
+    endif()
+endforeach()
+
+# ── civetweb：HTTP + WebSocket 服务器，C 单文件 ──
+add_library(civetweb STATIC ${civetweb_SOURCE_DIR}/src/civetweb.c)
+target_include_directories(civetweb PUBLIC ${civetweb_SOURCE_DIR}/include PRIVATE ${civetweb_SOURCE_DIR}/src)
+target_compile_definitions(civetweb PUBLIC NO_SSL USE_WEBSOCKET NO_CGI NO_FILES NO_CACHING MG_EXPERIMENTAL_INTERFACES=0)
+if(WIN32)
+    target_link_libraries(civetweb PUBLIC ws2_32)
+else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(civetweb PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+endif()
+
+# ── friday-voice ──
+add_executable(friday-voice
+    src/main.cpp
+    src/Backend.cpp
+    src/Fbank.cpp
+    src/SenseVoice.cpp
+    src/FsmnVad.cpp
+    src/Streamer.cpp
+    src/AudioIO.cpp
+    src/Server.cpp)
+target_include_directories(friday-voice PRIVATE src ${VOICE_HEADER_DIR})
+target_compile_definitions(friday-voice PRIVATE
+    VOICE_VERSION="${PROJECT_VERSION}"
+    $<$<BOOL:${VOICE_CUDA}>:VOICE_HAS_CUDA>
+    $<$<BOOL:${VOICE_VULKAN}>:VOICE_HAS_VULKAN>
+    $<$<BOOL:${VOICE_METAL}>:VOICE_HAS_METAL>
+    $<$<BOOL:${VOICE_OPENCL}>:VOICE_HAS_OPENCL>)
+target_link_libraries(friday-voice PRIVATE ggml civetweb)
+if(NOT WIN32)
+    target_link_libraries(friday-voice PRIVATE Threads::Threads)
+endif()
+install(TARGETS friday-voice RUNTIME DESTINATION bin)

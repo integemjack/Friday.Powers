@@ -2,7 +2,7 @@
 # 在 Linux（一般是 CI 的容器）里编 friday-voice：
 #   voice/ci/build-linux.sh <平台> <build 目录>
 # 平台：
-#   linux-arm64-jetson-orin  JetPack 6 / CUDA 12.6（在 nvcr.io/nvidia/l4t-cuda:12.6.11-devel 里编），cudart、cuBLAS 静态链接
+#   linux-arm64-jetson-orin  JetPack 6（在 nvcr.io/nvidia/l4t-cuda:12.2.12-devel 里编，CUDA 12.2 编的在 6.x 的驱动上都能跑），cudart、cuBLAS 静态链接
 #   linux-arm64-jetson-nano  JetPack 4（glibc 2.27、CUDA 10.2 编不了 ggml）：在 manylinux2014 里编纯 CPU、只有听写
 #   linux-arm64-vulkan       ARM64 Linux + Vulkan（高通 Adreno 等），要 ARMv8.2
 set -euo pipefail

@@ -54,7 +54,7 @@
       "models": ["sensevoice-small-q8", "fsmn-vad", "cosyvoice3-q8"]
     },
     "linux-arm64-jetson-orin": {
-      "detail": "Jetson Orin（JetPack 6，CUDA 12.6）",
+      "detail": "Jetson Orin（JetPack 6.x）",
       "models": ["sensevoice-small-q8", "fsmn-vad", "cosyvoice3-q4km"]
     },
     "linux-arm64-jetson-nano": {

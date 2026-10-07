@@ -18,7 +18,7 @@ concurrency:
 jobs:
   windows:
     name: ${{ matrix.target }}
-    runs-on: windows-2025
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -26,8 +26,11 @@ jobs:
         include:
           - target: windows-x64-vulkan
             backend: vulkan
+            runner: windows-2025
+          # CUDA 13.0 只认 VS 2019–2022，windows-2025 上的 VS 太新
           - target: windows-x64-cuda
             backend: cuda
+            runner: windows-2022
     steps:
       - uses: actions/checkout@v7
       - uses: ilammy/msvc-dev-cmd@v1.13.0

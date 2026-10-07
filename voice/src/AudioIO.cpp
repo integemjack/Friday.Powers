@@ -75,15 +75,28 @@ void pcm16ToFloat(const uint8_t* bytes, size_t size, std::vector<float>& out)
     }
 }
 
+void floatToPcm16(const float* samples, size_t count, std::string& out)
+{
+    const size_t old = out.size();
+    out.resize(old + count * 2);
+    for (size_t i = 0; i < count; ++i) {
+        const float v = samples[i] < -1.0f ? -1.0f : (samples[i] > 1.0f ? 1.0f : samples[i]);
+        const int16_t s = int16_t(v * 32767.0f);
+        out[old + 2 * i] = char(uint16_t(s) & 0xFF);
+        out[old + 2 * i + 1] = char(uint16_t(s) >> 8);
+    }
+}
+
 struct StreamResampler::Impl {
     ma_resampler resampler {};
     bool ready = false;
 };
 
-StreamResampler::StreamResampler(int inputRate) : m_rate(inputRate), m_impl(std::make_unique<Impl>())
+StreamResampler::StreamResampler(int inputRate, int outputRate)
+    : m_rate(inputRate), m_outRate(outputRate), m_impl(std::make_unique<Impl>())
 {
-    if (m_rate != kSampleRate && m_rate > 0) {
-        ma_resampler_config config = ma_resampler_config_init(ma_format_f32, 1, ma_uint32(m_rate), kSampleRate, ma_resample_algorithm_linear);
+    if (m_rate != m_outRate && m_rate > 0 && m_outRate > 0) {
+        ma_resampler_config config = ma_resampler_config_init(ma_format_f32, 1, ma_uint32(m_rate), ma_uint32(m_outRate), ma_resample_algorithm_linear);
         m_impl->ready = ma_resampler_init(&config, nullptr, &m_impl->resampler) == MA_SUCCESS;
     }
 }

@@ -4,6 +4,8 @@
 //   GET  /v1/models                 OpenAI 兼容的模型列表
 //   POST /v1/audio/transcriptions   OpenAI 兼容的一次性听录音（multipart：file、language、response_format）
 //   GET  /v1/realtime/transcribe    WebSocket 实时听写（docs/voice-protocol.md）
+//   POST /v1/audio/speech           OpenAI 兼容的合成（JSON：input、voice、speed、response_format wav|pcm、instructions），边合成边流式返回
+//   GET  /v1/realtime/speak         WebSocket 边写边读（docs/voice-protocol.md）
 #pragma once
 
 #include "Backend.h"
@@ -20,6 +22,8 @@ struct mg_connection;
 
 namespace voice {
 
+class Synthesizer;
+
 struct ServerOptions {
     std::string host = "127.0.0.1";
     int port = 0;          // 0 = 自己找一个空闲端口
@@ -30,7 +34,8 @@ struct ServerOptions {
 
 class Server {
 public:
-    Server(Backend& backend, SenseVoice& recognizer, FsmnVad& vad, const ServerOptions& options);
+    /// synthesizer 可以是空（没装合成模型时只有听写）
+    Server(Backend& backend, SenseVoice& recognizer, FsmnVad& vad, Synthesizer* synthesizer, const ServerOptions& options);
     ~Server();
 
     bool start(std::string* error);
@@ -43,8 +48,10 @@ public:
     int handleInfo(mg_connection* conn);
     int handleModels(mg_connection* conn);
     int handleTranscriptions(mg_connection* conn);
+    int handleSpeech(mg_connection* conn);
     bool authorized(const mg_connection* conn) const;
     void onSocketReady(mg_connection* conn);
+    void onSpeakSocketReady(mg_connection* conn);
     int onSocketData(mg_connection* conn, int bits, char* data, size_t size);
     void onSocketClose(const mg_connection* conn);
 
@@ -52,6 +59,7 @@ private:
     Backend& m_backend;
     SenseVoice& m_recognizer;
     FsmnVad& m_vad;
+    Synthesizer* m_synth;
     Fbank m_fbank;
     InferenceQueue m_queue;
     ServerOptions m_options;

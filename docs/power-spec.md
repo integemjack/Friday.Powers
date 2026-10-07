@@ -56,7 +56,9 @@ target 命名：`<os>-<arch>-<加速>`。Friday 按本机情况挑：NVIDIA 优�
 |---|---|---|
 | `transcription` | `POST /v1/audio/transcriptions`（OpenAI 兼容） | 一次性听录音；Friday 现有的「OpenAI 兼容」提供方直接能用 |
 | `realtimeTranscription` | `GET /v1/realtime/transcribe`（WebSocket） | 实时听写，见 `voice-protocol.md` |
-| `speech` | `POST /v1/audio/speech`（OpenAI 兼容） | 一次性合成（之后加） |
-| `realtimeSpeech` | `GET /v1/realtime/speak`（WebSocket） | 边写边读：文字流进去、音频流出来（之后加） |
+| `speech` | `POST /v1/audio/speech`（OpenAI 兼容） | 合成，边合成边分块返回（wav / pcm） |
+| `realtimeSpeech` | `GET /v1/realtime/speak`（WebSocket） | 边写边读：文字流进去、音频流出来，可打断，见 `voice-protocol.md` |
+
+`speech` / `realtimeSpeech` 只在装了合成模型（CosyVoice3 + 至少一个音色）时出现在 `/v1/info` 的 `capabilities` 里。
 
 `GET /v1/info` 返回 Power 的 id、版本、能力、设备、已加载的模型。

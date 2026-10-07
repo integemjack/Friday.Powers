@@ -2,10 +2,17 @@
 
 #include "Log.h"
 #include "Streamer.h"
+#ifdef VOICE_HAS_TTS
+#include "Speaker.h"
+#include "Synthesizer.h"
+#include "TextSplitter.h"
+#endif
 
 #include "civetweb.h"
 #include "json.hpp"
 
+#include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <map>
@@ -37,21 +44,30 @@ struct SocketIO {
     mg_connection* conn = nullptr;
     bool closed = false;
 
-    void send(const std::string& text)
+    void send(const std::string& text) { write(MG_WEBSOCKET_OPCODE_TEXT, text); }
+    void sendBinary(const std::string& data) { write(MG_WEBSOCKET_OPCODE_BINARY, data); }
+
+    void write(int opcode, const std::string& data)
     {
         std::lock_guard<std::mutex> lock(mutex);
         if (closed || !conn)
             return;
         mg_lock_connection(conn);
-        mg_websocket_write(conn, MG_WEBSOCKET_OPCODE_TEXT, text.data(), text.size());
+        mg_websocket_write(conn, opcode, data.data(), data.size());
         mg_unlock_connection(conn);
     }
 };
 
+/// 一条 WebSocket 连接：实时听写（streamer）或边写边读（speaker），二选一
 struct Session {
     std::shared_ptr<SocketIO> io;
     std::shared_ptr<Streamer> streamer;
+#ifdef VOICE_HAS_TTS
+    std::shared_ptr<Speaker> speaker;
+#endif
 };
+
+std::atomic<uint64_t> g_nextSpeechOwner { uint64_t(1) << 48 };   // HTTP 合成请求的 owner，和 Speaker 的分开
 
 void reply(mg_connection* conn, int status, const std::string& body, const char* mime = "application/json")
 {
@@ -96,8 +112,10 @@ int healthHandler(mg_connection* conn, void* data) { return static_cast<Server*>
 int infoHandler(mg_connection* conn, void* data) { return static_cast<Server*>(data)->handleInfo(conn); }
 int modelsHandler(mg_connection* conn, void* data) { return static_cast<Server*>(data)->handleModels(conn); }
 int transcriptionsHandler(mg_connection* conn, void* data) { return static_cast<Server*>(data)->handleTranscriptions(conn); }
+int speechHandler(mg_connection* conn, void* data) { return static_cast<Server*>(data)->handleSpeech(conn); }
 int socketConnect(const mg_connection* conn, void* data) { return static_cast<Server*>(data)->authorized(conn) ? 0 : 1; }
 void socketReady(mg_connection* conn, void* data) { static_cast<Server*>(data)->onSocketReady(conn); }
+void speakSocketReady(mg_connection* conn, void* data) { static_cast<Server*>(data)->onSpeakSocketReady(conn); }
 int socketData(mg_connection* conn, int bits, char* payload, size_t size, void* data)
 {
     return static_cast<Server*>(data)->onSocketData(conn, bits, payload, size);
@@ -112,8 +130,8 @@ int logMessage(const mg_connection*, const char* message)
 
 } // namespace
 
-Server::Server(Backend& backend, SenseVoice& recognizer, FsmnVad& vad, const ServerOptions& options)
-    : m_backend(backend), m_recognizer(recognizer), m_vad(vad), m_options(options)
+Server::Server(Backend& backend, SenseVoice& recognizer, FsmnVad& vad, Synthesizer* synthesizer, const ServerOptions& options)
+    : m_backend(backend), m_recognizer(recognizer), m_vad(vad), m_synth(synthesizer), m_options(options)
 {
 }
 
@@ -156,6 +174,10 @@ bool Server::start(std::string* error)
     mg_set_request_handler(m_ctx, "/v1/models", modelsHandler, this);
     mg_set_request_handler(m_ctx, "/v1/audio/transcriptions", transcriptionsHandler, this);
     mg_set_websocket_handler(m_ctx, "/v1/realtime/transcribe", socketConnect, socketReady, socketData, socketClose, this);
+    if (m_synth) {
+        mg_set_request_handler(m_ctx, "/v1/audio/speech", speechHandler, this);
+        mg_set_websocket_handler(m_ctx, "/v1/realtime/speak", socketConnect, speakSocketReady, socketData, socketClose, this);
+    }
     return true;
 }
 
@@ -202,13 +224,24 @@ int Server::handleInfo(mg_connection* conn)
         devices.push_back({ { "backend", d.backend }, { "name", d.name }, { "description", d.description }, { "type", d.type },
                             { "memory_free", d.memoryFree }, { "memory_total", d.memoryTotal } });
     const DeviceInfo& d = m_backend.device();
+    json capabilities = { "transcription", "realtimeTranscription" };
+    json models = { { "asr", m_recognizer.path() }, { "asr_bytes", m_recognizer.weightsBytes() } };
+#ifdef VOICE_HAS_TTS
+    if (m_synth) {
+        capabilities.push_back("speech");
+        capabilities.push_back("realtimeSpeech");
+        models["tts"] = m_synth->path();
+        models["tts_sample_rate"] = m_synth->sampleRate();
+        models["voices"] = m_synth->voices();
+    }
+#endif
     const json info {
         { "id", "voice" },
         { "version", VOICE_VERSION },
-        { "capabilities", { "transcription", "realtimeTranscription" } },
+        { "capabilities", capabilities },
         { "device", { { "backend", d.backend }, { "name", d.name }, { "description", d.description } } },
         { "devices", devices },
-        { "models", { { "asr", m_recognizer.path() }, { "asr_bytes", m_recognizer.weightsBytes() } } },
+        { "models", models },
         { "queue", m_queue.pending() },
     };
     reply(conn, 200, info.dump());
@@ -221,8 +254,11 @@ int Server::handleModels(mg_connection* conn)
         replyError(conn, 401, "unauthorized");
         return 401;
     }
-    reply(conn, 200,
-          json { { "object", "list" }, { "data", { { { "id", "sensevoice-small" }, { "object", "model" }, { "owned_by", "friday-powers" } } } } }.dump());
+    json data = json::array();
+    data.push_back({ { "id", "sensevoice-small" }, { "object", "model" }, { "owned_by", "friday-powers" } });
+    if (m_synth)
+        data.push_back({ { "id", "cosyvoice3" }, { "object", "model" }, { "owned_by", "friday-powers" } });
+    reply(conn, 200, json { { "object", "list" }, { "data", data } }.dump());
     return 200;
 }
 
@@ -292,6 +328,145 @@ int Server::handleTranscriptions(mg_connection* conn)
     return 200;
 }
 
+int Server::handleSpeech(mg_connection* conn)
+{
+    if (!authorized(conn)) {
+        replyError(conn, 401, "unauthorized");
+        return 401;
+    }
+    const mg_request_info* info = mg_get_request_info(conn);
+    if (!info || std::strcmp(info->request_method, "POST") != 0) {
+        replyError(conn, 405, "use POST application/json");
+        return 405;
+    }
+#ifndef VOICE_HAS_TTS
+    replyError(conn, 501, "built without speech synthesis");
+    return 501;
+#else
+    std::string body;
+    char buffer[8192];
+    for (int n; (n = mg_read(conn, buffer, sizeof(buffer))) > 0;)
+        body.append(buffer, size_t(n));
+    const json request = json::parse(body, nullptr, false);
+    if (!request.is_object() || !request.contains("input") || !request["input"].is_string()) {
+        replyError(conn, 400, "missing string field 'input'");
+        return 400;
+    }
+    // OpenAI 的音色名（alloy 等）这里没有，认不出的一律用默认音色
+    std::string voice = request.value("voice", std::string());
+    if (!m_synth->hasVoice(voice))
+        voice.clear();
+    const float speed = std::clamp(request.value("speed", 1.0f), 0.5f, 2.0f);
+    const std::string instruction = request.value("instructions", std::string());
+    // 只出 wav / pcm（不带编码器）；要 mp3 等也给 wav
+    const std::string format = request.value("response_format", std::string("wav")) == "pcm" ? "pcm" : "wav";
+    const int sampleRate = std::clamp(request.value("sample_rate", m_synth->sampleRate()), 8000, 48000);
+
+    TextSplitter splitter;
+    std::vector<std::string> segments = splitter.push(request["input"].get<std::string>());
+    for (std::string& s : splitter.flush())
+        segments.push_back(std::move(s));
+    if (segments.empty()) {
+        replyError(conn, 400, "nothing to say in 'input'");
+        return 400;
+    }
+
+    // 第一块音频出来才发响应头（之前失败还能回错误）；之后分块边合成边发
+    bool headersSent = false, broken = false;
+    const auto sendHeaders = [&] {
+        if (headersSent)
+            return;
+        headersSent = true;
+        mg_printf(conn,
+                  "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nTransfer-Encoding: chunked\r\nCache-Control: no-cache\r\n"
+                  "Connection: close\r\n\r\n",
+                  format == "pcm" ? "audio/pcm" : "audio/wav");
+        if (format == "wav") {
+            // 流式 WAV：长度先写成最大值，播放器读到流结束为止
+            const uint32_t rate = uint32_t(sampleRate), byteRate = rate * 2, unknown = 0xFFFFFFFFu;
+            std::string header = "RIFF";
+            const auto u32 = [&](uint32_t v) { header.append(reinterpret_cast<const char*>(&v), 4); };
+            const auto u16 = [&](uint16_t v) { header.append(reinterpret_cast<const char*>(&v), 2); };
+            u32(unknown);
+            header += "WAVEfmt ";
+            u32(16);
+            u16(1);
+            u16(1);
+            u32(rate);
+            u32(byteRate);
+            u16(2);
+            u16(16);
+            header += "data";
+            u32(unknown);
+            mg_send_chunk(conn, header.data(), unsigned(header.size()));
+        }
+    };
+    const uint64_t owner = g_nextSpeechOwner++;
+    const auto started = std::chrono::steady_clock::now();
+    StreamResampler resampler(m_synth->sampleRate(), sampleRate);
+    std::vector<float> resampled;
+    std::string pcm;
+    size_t total = 0;
+    double firstAudio = -1;
+    for (const std::string& segment : segments) {
+        const SpeakResult r = m_synth->speak(owner, segment, voice, speed, instruction, [&](const float* samples, size_t count) {
+            if (firstAudio < 0)
+                firstAudio = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            resampled.clear();
+            resampler.process(samples, count, resampled);
+            pcm.clear();
+            floatToPcm16(resampled.data(), resampled.size(), pcm);
+            total += resampled.size();
+            sendHeaders();
+            if (mg_send_chunk(conn, pcm.data(), unsigned(pcm.size())) < 0) {
+                broken = true;   // 对方断开了
+                return false;
+            }
+            return true;
+        });
+        if (broken)
+            break;
+        if (!r.ok) {
+            if (!headersSent) {
+                replyError(conn, 500, r.error);
+                return 500;
+            }
+            break;
+        }
+    }
+    if (!headersSent) {
+        replyError(conn, 500, "合成没有出声音");
+        return 500;
+    }
+    if (!broken)
+        mg_send_chunk(conn, "", 0);
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    VLOG_INFO("合成：%d 段，%.2f 秒音频，用时 %.3f 秒（首块 %.3f 秒）", int(segments.size()), total / double(sampleRate), seconds, firstAudio);
+    return 200;
+#endif
+}
+
+void Server::onSpeakSocketReady(mg_connection* conn)
+{
+#ifdef VOICE_HAS_TTS
+    auto io = std::make_shared<SocketIO>();
+    io->conn = conn;
+    auto* session = new Session;
+    session->io = io;
+    session->speaker = std::make_shared<Speaker>(*m_synth, [io](const std::string& text) { io->send(text); },
+                                                 [io](const std::string& data) { io->sendBinary(data); });
+    session->speaker->start();
+    mg_set_user_connection_data(conn, session);
+    const DeviceInfo& d = m_backend.device();
+    io->send(json { { "type", "ready" }, { "model", "cosyvoice3" }, { "device", d.backend + " " + d.description },
+                    { "sample_rate", m_synth->sampleRate() }, { "voices", m_synth->voices() }, { "voice", m_synth->defaultVoice() } }
+                 .dump());
+    VLOG_INFO("边写边读连接");
+#else
+    (void)conn;
+#endif
+}
+
 void Server::onSocketReady(mg_connection* conn)
 {
     auto io = std::make_shared<SocketIO>();
@@ -316,6 +491,34 @@ int Server::onSocketData(mg_connection* conn, int bits, char* data, size_t size)
     const int opcode = bits & 0x0f;
     if (opcode == MG_WEBSOCKET_OPCODE_CONNECTION_CLOSE)
         return 0;
+#ifdef VOICE_HAS_TTS
+    if (session->speaker) {
+        if (opcode != MG_WEBSOCKET_OPCODE_TEXT)
+            return 1;
+        const json message = json::parse(std::string(data, size), nullptr, false);
+        if (!message.is_object())
+            return 1;
+        const std::string type = message.value("type", "");
+        if (type == "start") {
+            SpeakConfig config;
+            config.voice = message.value("voice", config.voice);
+            config.instruction = message.value("instruction", config.instruction);
+            config.speed = message.value("speed", config.speed);
+            config.sampleRate = message.value("sample_rate", m_synth->sampleRate());
+            session->speaker->configure(config);
+        } else if (type == "text") {
+            session->speaker->text(message.value("text", std::string()));
+        } else if (type == "flush") {
+            session->speaker->flush();
+        } else if (type == "say") {
+            session->speaker->text(message.value("text", std::string()));
+            session->speaker->flush();
+        } else if (type == "cancel") {
+            session->speaker->cancel();
+        }
+        return 1;
+    }
+#endif
     if (opcode == MG_WEBSOCKET_OPCODE_BINARY || opcode == MG_WEBSOCKET_OPCODE_CONTINUATION) {
         session->streamer->feedPcm16(reinterpret_cast<const uint8_t*>(data), size);
         return 1;
@@ -354,6 +557,14 @@ void Server::onSocketClose(const mg_connection* conn)
         std::lock_guard<std::mutex> lock(session->io->mutex);
         session->io->closed = true;
     }
+#ifdef VOICE_HAS_TTS
+    if (session->speaker) {
+        session->speaker->close();
+        delete session;
+        VLOG_INFO("边写边读断开");
+        return;
+    }
+#endif
     session->streamer->close();
     delete session;
     VLOG_INFO("实时听写断开");

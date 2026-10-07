@@ -25,6 +25,7 @@ option(VOICE_CUDA   "CUDA 后端（NVIDIA）" OFF)
 option(VOICE_VULKAN "Vulkan 后端（NVIDIA / AMD / Intel / Adreno）" OFF)
 option(VOICE_METAL  "Metal 后端（Apple）" OFF)
 option(VOICE_OPENCL "OpenCL 后端（Adreno 等）" OFF)
+option(VOICE_TTS    "流式合成（CosyVoice3，cosyvoice.cpp）" ON)
 
 # ── ggml：静态、所有后端编进同一个文件 ──
 set(BUILD_SHARED_LIBS   OFF CACHE BOOL "" FORCE)
@@ -32,6 +33,7 @@ set(GGML_BACKEND_DL     OFF CACHE BOOL "" FORCE)
 set(GGML_NATIVE         OFF CACHE BOOL "")          # 默认可移植；本机调试可 -DGGML_NATIVE=ON
 set(GGML_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(GGML_OPENMP         OFF CACHE BOOL "" FORCE)    # 用 ggml 自己的线程池：OpenMP 运行库（vcomp140.dll / libgomp）是动态的
 set(GGML_CUDA   ${VOICE_CUDA}   CACHE BOOL "" FORCE)
 set(GGML_VULKAN ${VOICE_VULKAN} CACHE BOOL "" FORCE)
 set(GGML_METAL  ${VOICE_METAL}  CACHE BOOL "" FORCE)
@@ -88,6 +90,75 @@ else()
     target_link_libraries(civetweb PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
 endif()
 
+# ── cosyvoice.cpp：CosyVoice3 合成，只编库本身（不走它的 CMake：它会再带一份 ggml、开 LTO、编工具）──
+#   不要 ONNX 前端（音色 prompt_speech.gguf 离线生成好随模型下载）、不要 ICU（数字读法以后自己规整）、不要它的音频读写
+if(VOICE_TTS)
+    FetchContent_Declare(cosyvoice
+        URL https://github.com/Lourdle/cosyvoice.cpp/archive/6743f9299f4a9cecd05b8f7a2ad5a45a65cf98b1.zip
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    # 和 cosyvoice.cpp 的 vendor/pcre2 子模块同一个提交（分词的正则用）
+    FetchContent_Declare(pcre2
+        URL https://github.com/PCRE2Project/pcre2/archive/7978954dbd2efc6f2196869290553cf1871b4ce6.zip
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    FetchContent_GetProperties(cosyvoice)
+    if(NOT cosyvoice_POPULATED)
+        FetchContent_Populate(cosyvoice)
+    endif()
+    set(PCRE2_BUILD_PCRE2_8     ON  CACHE BOOL "" FORCE)
+    set(PCRE2_BUILD_PCRE2_16    ON  CACHE BOOL "" FORCE)
+    set(PCRE2_BUILD_TESTS       OFF CACHE BOOL "" FORCE)
+    set(PCRE2_BUILD_PCRE2GREP   OFF CACHE BOOL "" FORCE)
+    set(PCRE2_SUPPORT_JIT       OFF CACHE BOOL "" FORCE)
+    set(PCRE2_STATIC_RUNTIME    ON  CACHE BOOL "" FORCE)
+    set(BUILD_STATIC_LIBS       ON  CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(pcre2)
+
+    set(CV ${cosyvoice_SOURCE_DIR})
+    file(GLOB CV_SOURCES ${CV}/src/*.cpp ${CV}/common/*.cpp)
+    list(REMOVE_ITEM CV_SOURCES
+        ${CV}/src/cosyvoice-audio.cpp ${CV}/src/cosyvoice-audio-ffmpeg.cpp ${CV}/src/cosyvoice-frontend.cpp)
+    include(CheckCXXSourceCompiles)
+    check_cxx_source_compiles("#if !defined(__x86_64__) && !defined(_M_X64)\n#error not x86\n#endif\nint main() { return 0; }" VOICE_X86)
+    set(CV_DEFS COSYVOICE_NO_ICU)
+    if(VOICE_X86)
+        # SIMD 各档一个源文件、各用自己的指令集编，运行时按 CPU 挑
+        set(CV_GNU_sse42  -msse4.2)
+        set(CV_GNU_avx    -msse4.2 -mavx)
+        set(CV_GNU_avx2   -msse4.2 -mavx -mavx2 -mfma)
+        set(CV_GNU_avx512 -msse4.2 -mavx -mavx2 -mfma -mavx512f -mavx512bw -mavx512dq)
+        set(CV_MSVC_sse42  /arch:SSE4.2)
+        set(CV_MSVC_avx    /arch:AVX)
+        set(CV_MSVC_avx2   /arch:AVX2)
+        set(CV_MSVC_avx512 /arch:AVX512)
+        list(APPEND CV_DEFS COSYVOICE_HAS_SCALAR COSYVOICE_HAS_SSE42 COSYVOICE_HAS_AVX COSYVOICE_HAS_AVX2 COSYVOICE_HAS_AVX512)
+        foreach(name scalar sse42 avx avx2 avx512)
+            set(file ${CV}/src/simd/kernels_${name}.cpp)
+            list(APPEND CV_SOURCES ${file})
+            if(MSVC)
+                set(flags ${CV_MSVC_${name}})
+            else()
+                set(flags ${CV_GNU_${name}})
+            endif()
+            if(flags)
+                set_source_files_properties(${file} PROPERTIES COMPILE_OPTIONS "${flags}")
+            endif()
+        endforeach()
+    else()
+        list(REMOVE_ITEM CV_SOURCES ${CV}/src/simd_detect.cpp ${CV}/src/cosyvoice-simd.cpp)
+        list(APPEND CV_DEFS COSYVOICE_NO_SIMD)
+    endif()
+    add_library(cosyvoice_core STATIC ${CV_SOURCES})
+    target_compile_features(cosyvoice_core PRIVATE cxx_std_20)
+    target_include_directories(cosyvoice_core PUBLIC ${CV}/include PRIVATE ${CV}/src ${CV}/common)
+    target_compile_definitions(cosyvoice_core PUBLIC COSYVOICE_STATIC PRIVATE ${CV_DEFS})
+    target_link_libraries(cosyvoice_core PRIVATE ggml pcre2-8 pcre2-16)
+    if(MSVC)
+        target_compile_options(cosyvoice_core PRIVATE /Zc:preprocessor /bigobj /W0)
+    else()
+        target_compile_options(cosyvoice_core PRIVATE -w)
+    endif()
+endif()
+
 # ── friday-voice ──
 add_executable(friday-voice
     src/main.cpp
@@ -106,7 +177,14 @@ target_compile_definitions(friday-voice PRIVATE
     $<$<BOOL:${VOICE_METAL}>:VOICE_HAS_METAL>
     $<$<BOOL:${VOICE_OPENCL}>:VOICE_HAS_OPENCL>)
 target_link_libraries(friday-voice PRIVATE ggml civetweb)
-if(NOT WIN32)
+if(VOICE_TTS)
+    target_sources(friday-voice PRIVATE src/Synthesizer.cpp src/TextSplitter.cpp src/Speaker.cpp)
+    target_compile_definitions(friday-voice PRIVATE VOICE_HAS_TTS)
+    target_link_libraries(friday-voice PRIVATE cosyvoice_core)
+endif()
+if(WIN32)
+    target_link_libraries(friday-voice PRIVATE shell32)
+else()
     target_link_libraries(friday-voice PRIVATE Threads::Threads)
 endif()
 install(TARGETS friday-voice RUNTIME DESTINATION bin)

@@ -14,6 +14,17 @@ common=(-DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF)
 case "$target" in
 linux-arm64-jetson-orin)
     export PATH=/usr/local/cuda/bin:$PATH
+    # 静态的 cuBLAS 带着所有架构的内核（包要 400 MB）：容器里先裁到只剩 Orin 的 sm_87
+    if command -v nvprune >/dev/null; then
+        for lib in libcublas_static.a libcublasLt_static.a; do
+            path=/usr/local/cuda/lib64/$lib
+            if [ -f "$path" ]; then
+                before=$(stat -c %s "$path")
+                nvprune --generate-code arch=compute_87,code=sm_87 "$path" -o "/tmp/$lib" && mv "/tmp/$lib" "$path"
+                echo "nvprune $lib：$((before / 1048576)) MB → $(($(stat -c %s "$path") / 1048576)) MB"
+            fi
+        done
+    fi
     args=(-DVOICE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=87 -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
           -DCMAKE_C_COMPILER=gcc-13 -DCMAKE_CXX_COMPILER=g++-13 -DCMAKE_CUDA_HOST_COMPILER=g++-11
           -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16)

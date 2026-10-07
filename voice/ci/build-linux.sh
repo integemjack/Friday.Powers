@@ -15,6 +15,7 @@ case "$target" in
 linux-arm64-jetson-orin)
     export PATH=/usr/local/cuda/bin:$PATH
     args=(-DVOICE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=87 -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
+          -DCMAKE_C_COMPILER=gcc-13 -DCMAKE_CXX_COMPILER=g++-13 -DCMAKE_CUDA_HOST_COMPILER=g++-11
           -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16)
     ;;
 linux-arm64-jetson-nano)

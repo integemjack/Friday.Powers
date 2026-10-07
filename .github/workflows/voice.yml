@@ -112,9 +112,11 @@ jobs:
         include:
           - target: linux-arm64-jetson-orin
             image: nvcr.io/nvidia/l4t-cuda:12.2.12-devel
+            # cosyvoice.cpp 要 C++20 的 <format>（GCC 13 起才有）：C/C++ 用 PPA 的 GCC 13，nvcc 12.2 的宿主编译器仍是 GCC 11
             setup: >-
-              apt-get update && apt-get install -y --no-install-recommends build-essential ninja-build python3 python3-pip ca-certificates binutils &&
-              pip3 install --no-cache-dir 'cmake>=3.28'
+              apt-get update && apt-get install -y --no-install-recommends build-essential ninja-build python3 python3-pip ca-certificates binutils
+              software-properties-common gpg-agent && add-apt-repository -y ppa:ubuntu-toolchain-r/test && apt-get update &&
+              apt-get install -y --no-install-recommends g++-13 && pip3 install --no-cache-dir 'cmake>=3.28'
           - target: linux-arm64-jetson-nano
             image: quay.io/pypa/manylinux2014_aarch64
             setup: >-
@@ -129,7 +131,7 @@ jobs:
       # 在容器里编（Jetson 要 L4T 的 CUDA，Nano 要老 glibc），工作区挂进去
       - name: 编译
         run: |
-          docker run --rm -v "$PWD:/src" -w /src ${{ matrix.image }} bash -c \
+          docker run --rm -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 -v "$PWD:/src" -w /src ${{ matrix.image }} bash -c \
             "set -e; ${{ matrix.setup }}; bash voice/ci/build-linux.sh ${{ matrix.target }} build"
       - name: 打包
         run: |

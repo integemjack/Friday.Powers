@@ -72,6 +72,33 @@ bool worthShowing(const Transcript& t, bool firstInSegment)
     return true;
 }
 
+/// 定稿值不值得发：整句都是杂音（敲键盘、咳嗽、背景音乐）时模型也会猜出「Yeah。」「嗯。」——
+/// 事件标签不是 Speech 的、情绪标签是 EMO_UNKNOWN 且只有一个词 / 两个字以内的，当成没说话（发 speech_end）
+bool worthFinal(const Transcript& t)
+{
+    if (!t.event.empty() && t.event != "Speech")
+        return false;
+    if (t.emotion != "EMO_UNKNOWN")
+        return true;
+    int cjk = 0, words = 0;
+    bool inWord = false;
+    for (size_t i = 0; i < t.text.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(t.text[i]);
+        if (c >= 0xE3 && c <= 0xEF) {
+            ++cjk;   // 三字节字符（中日韩文字和全角标点，标点也算一个，宽一点）
+            i += 2;
+            inWord = false;
+        } else if (std::isalnum(c)) {
+            if (!inWord)
+                ++words;
+            inWord = true;
+        } else {
+            inWord = false;
+        }
+    }
+    return cjk > 3 || words > 1;
+}
+
 struct Machine {
     const StreamConfig& config;
     std::vector<uint8_t> window = std::vector<uint8_t>(kWindowFrames, 0);
@@ -290,7 +317,8 @@ void Streamer::endSegment(int endFrame, const char* reason)
         const int64_t latency = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - detected).count();
         if (!t.ok) {
             self->emit(json { { "type", "error" }, { "segment", segment }, { "message", t.error } }.dump());
-        } else if (t.text.empty()) {
+        } else if (t.text.empty() || !worthFinal(t)) {
+            VLOG_DEBUG("第 %d 句不算说话：%s [%s/%s]", segment, t.text.c_str(), t.emotion.c_str(), t.event.c_str());
             self->emit(json { { "type", "speech_end" }, { "segment", segment } }.dump());
         } else {
             self->emit(json { { "type", "final" }, { "segment", segment }, { "text", t.text }, { "start_ms", startMs }, { "end_ms", endMs },

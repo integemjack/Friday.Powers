@@ -26,8 +26,9 @@ Friday 主程序只接在线模型、保持小巧；要用到本机 GPU 的重�
 
 | 平台 | 加速 | 说明 |
 |---|---|---|
-| `windows-x64-vulkan` | Vulkan | 单个 exe，NVIDIA / AMD / Intel 都能用 |
-| `windows-x64-cuda` | CUDA 13 | 带 cuBLAS 的 DLL，NVIDIA 上更快 |
+| `windows-x64-vulkan` | Vulkan | 单个 exe（约 49 MB），NVIDIA / AMD / Intel 都能用；默认 |
+| `windows-x64-cuda` | CUDA 13 | 带 cuBLAS 的 DLL（约 420 MB）；RTX 5080 上 Vulkan 反而更快，留作备选 |
+| `macos-arm64-metal` | Metal | Apple 芯片的 Mac |
 | `linux-arm64-jetson-orin` | CUDA（L4T） | JetPack 6.x；CUDA 运行库和 cuBLAS 静态链接 |
 | `linux-arm64-jetson-nano` | CPU | 初代 Nano（JetPack 4）编不了 ggml 的 CUDA：只用 CPU 听写，合成用在线服务 |
 | `linux-arm64-vulkan` | Vulkan | 高通 Adreno 等 ARM64 板子（如 Arduino VENTUNO Q），要 ARMv8.2 |

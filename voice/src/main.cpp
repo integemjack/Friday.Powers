@@ -43,6 +43,8 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <shellapi.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
 #endif
 
 #ifndef VOICE_VERSION
@@ -162,6 +164,12 @@ fs::path executableDir()
     const DWORD n = GetModuleFileNameW(nullptr, path.data(), DWORD(path.size()));
     path.resize(n);
     return fs::path(path).parent_path();
+#elif defined(__APPLE__)
+    char path[4096];
+    uint32_t size = sizeof(path);
+    if (_NSGetExecutablePath(path, &size) == 0)
+        return fs::weakly_canonical(fs::u8path(path)).parent_path();
+    return fs::current_path();
 #else
     std::error_code ec;
     const fs::path self = fs::read_symlink("/proc/self/exe", ec);

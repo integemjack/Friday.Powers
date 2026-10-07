@@ -4,8 +4,24 @@
   "title": "本地语音",
   "detail": "用本机 GPU 实时听写（边说边出字幕，说完一句出带标点的定稿）和边写边读（大模型边出字边念，可打断）；不联网、不花钱。",
   "executable": "friday-voice",
-  "serve": ["serve", "--models", "{models}", "--host", "127.0.0.1", "--port", "0", "--token", "{token}", "--parent-stdin"],
-  "capabilities": ["transcription", "realtimeTranscription", "speech", "realtimeSpeech"],
+  "serve": [
+    "serve",
+    "--models",
+    "{models}",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "0",
+    "--token",
+    "{token}",
+    "--parent-stdin"
+  ],
+  "capabilities": [
+    "transcription",
+    "realtimeTranscription",
+    "speech",
+    "realtimeSpeech"
+  ],
   "models": [
     {
       "id": "sensevoice-small-q8",
@@ -46,25 +62,55 @@
   ],
   "targets": {
     "windows-x64-vulkan": {
-      "detail": "Windows x64，Vulkan（NVIDIA / AMD / Intel 显卡都能用）",
-      "models": ["sensevoice-small-q8", "fsmn-vad", "cosyvoice3-q8"]
+      "detail": "Windows x64，Vulkan（单个 exe；NVIDIA / AMD / Intel 显卡都能用，RTX 5080 上比 CUDA 还快）",
+      "models": [
+        "sensevoice-small-q8",
+        "fsmn-vad",
+        "cosyvoice3-q8"
+      ]
     },
     "windows-x64-cuda": {
-      "detail": "Windows x64，NVIDIA CUDA（比 Vulkan 快，包里带 cuBLAS，约 420 MB）",
-      "models": ["sensevoice-small-q8", "fsmn-vad", "cosyvoice3-q8"]
+      "detail": "Windows x64，NVIDIA CUDA（包里带 cuBLAS，约 420 MB；Vulkan 不好用时再选）",
+      "models": [
+        "sensevoice-small-q8",
+        "fsmn-vad",
+        "cosyvoice3-q8"
+      ]
+    },
+    "macos-arm64-metal": {
+      "detail": "macOS（Apple 芯片），Metal",
+      "models": [
+        "sensevoice-small-q8",
+        "fsmn-vad",
+        "cosyvoice3-q8"
+      ]
     },
     "linux-arm64-jetson-orin": {
       "detail": "Jetson Orin（JetPack 6.x）",
-      "models": ["sensevoice-small-q8", "fsmn-vad", "cosyvoice3-q4km"]
+      "models": [
+        "sensevoice-small-q8",
+        "fsmn-vad",
+        "cosyvoice3-q4km"
+      ]
     },
     "linux-arm64-jetson-nano": {
       "detail": "初代 Jetson Nano（JetPack 4）：只用 CPU 听写，合成用在线服务",
-      "models": ["sensevoice-small-q8", "fsmn-vad"],
-      "capabilities": ["transcription", "realtimeTranscription"]
+      "models": [
+        "sensevoice-small-q8",
+        "fsmn-vad"
+      ],
+      "capabilities": [
+        "transcription",
+        "realtimeTranscription"
+      ]
     },
     "linux-arm64-vulkan": {
       "detail": "ARM64 Linux，Vulkan（高通 Adreno 等；要 ARMv8.2 的 CPU）",
-      "models": ["sensevoice-small-q8", "fsmn-vad", "cosyvoice3-q8"]
+      "models": [
+        "sensevoice-small-q8",
+        "fsmn-vad",
+        "cosyvoice3-q8"
+      ]
     }
   }
 }

@@ -77,6 +77,28 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  macos:
+    name: macos-arm64-metal
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - name: 编译
+        run: |
+          brew list ninja >/dev/null 2>&1 || brew install ninja
+          cmake -S voice -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DVOICE_METAL=ON -DGGML_NATIVE=OFF \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0
+          cmake --build build
+          ./build/bin/friday-voice --version
+          otool -L build/bin/friday-voice
+      - name: 打包
+        run: python3 voice/ci/package.py --target macos-arm64-metal --build build --out dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-arm64-metal
+          path: dist/*
+          if-no-files-found: error
+
   linux:
     name: ${{ matrix.target }}
     runs-on: ubuntu-24.04-arm
@@ -118,7 +140,7 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/voice-v')
-    needs: [windows, linux]
+    needs: [windows, macos, linux]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7

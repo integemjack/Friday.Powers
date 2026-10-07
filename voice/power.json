@@ -1,0 +1,70 @@
+{
+  "schema": 1,
+  "id": "voice",
+  "title": "本地语音",
+  "detail": "用本机 GPU 实时听写（边说边出字幕，说完一句出带标点的定稿）和边写边读（大模型边出字边念，可打断）；不联网、不花钱。",
+  "executable": "friday-voice",
+  "serve": ["serve", "--models", "{models}", "--host", "127.0.0.1", "--port", "0", "--token", "{token}", "--parent-stdin"],
+  "capabilities": ["transcription", "realtimeTranscription", "speech", "realtimeSpeech"],
+  "models": [
+    {
+      "id": "sensevoice-small-q8",
+      "file": "sensevoice-small-q8.gguf",
+      "url": "https://modelscope.cn/models/FunAudioLLM/SenseVoiceSmall-GGUF/resolve/master/sensevoice-small-q8.gguf",
+      "sha256": "4ae45c94422de949b387e2e0fb10d7e14e4c42c69db30c3444ecc7d4b844b7c5",
+      "size": 254208320,
+      "purpose": "听写（SenseVoice-Small，中英日韩粤）",
+      "license": "FunASR 模型许可（https://github.com/modelscope/FunASR/blob/main/MODEL_LICENSE）"
+    },
+    {
+      "id": "fsmn-vad",
+      "file": "fsmn-vad.gguf",
+      "url": "https://modelscope.cn/models/FunAudioLLM/fsmn-vad-GGUF/resolve/master/fsmn-vad.gguf",
+      "sha256": "1270f2559c495f4e7b6e739541151027d360761a3fda43fc147034f5719f5479",
+      "size": 1720512,
+      "purpose": "断句（FSMN-VAD）",
+      "license": "FunASR 模型许可（https://github.com/modelscope/FunASR/blob/main/MODEL_LICENSE）"
+    },
+    {
+      "id": "cosyvoice3-q8",
+      "file": "cosyvoice3/CosyVoice3-2512_Q8_0.gguf",
+      "url": "https://modelscope.cn/models/Lourdle/Fun-CosyVoice3-0.5B-2512-GGUF/resolve/master/CosyVoice3-2512_Q8_0.gguf",
+      "sha256": "be133cb6154ca73cd1d213b1c9496def99ba9c1f7c14cd99f6b350af2eb7963d",
+      "size": 943933536,
+      "purpose": "合成（Fun-CosyVoice3-0.5B，Q8_0）",
+      "license": "Apache-2.0"
+    },
+    {
+      "id": "cosyvoice3-q4km",
+      "file": "cosyvoice3/CosyVoice3-2512_Q4_K_M.gguf",
+      "url": "https://modelscope.cn/models/Lourdle/Fun-CosyVoice3-0.5B-2512-GGUF/resolve/master/CosyVoice3-2512_Q4_K_M.gguf",
+      "sha256": "eb40867e270abdcde4ea958e634d5932702e16545d46336659fed9f8f462bc02",
+      "size": 629141792,
+      "purpose": "合成（Fun-CosyVoice3-0.5B，Q4_K_M，省显存）",
+      "license": "Apache-2.0"
+    }
+  ],
+  "targets": {
+    "windows-x64-vulkan": {
+      "detail": "Windows x64，Vulkan（NVIDIA / AMD / Intel 显卡都能用）",
+      "models": ["sensevoice-small-q8", "fsmn-vad", "cosyvoice3-q8"]
+    },
+    "windows-x64-cuda": {
+      "detail": "Windows x64，NVIDIA CUDA（比 Vulkan 快，包里带 cuBLAS，约 420 MB）",
+      "models": ["sensevoice-small-q8", "fsmn-vad", "cosyvoice3-q8"]
+    },
+    "linux-arm64-jetson-orin": {
+      "detail": "Jetson Orin（JetPack 6，CUDA 12.6）",
+      "models": ["sensevoice-small-q8", "fsmn-vad", "cosyvoice3-q4km"]
+    },
+    "linux-arm64-jetson-nano": {
+      "detail": "初代 Jetson Nano（JetPack 4）：只用 CPU 听写，合成用在线服务",
+      "models": ["sensevoice-small-q8", "fsmn-vad"],
+      "capabilities": ["transcription", "realtimeTranscription"]
+    },
+    "linux-arm64-vulkan": {
+      "detail": "ARM64 Linux，Vulkan（高通 Adreno 等；要 ARMv8.2 的 CPU）",
+      "models": ["sensevoice-small-q8", "fsmn-vad", "cosyvoice3-q8"]
+    }
+  }
+}

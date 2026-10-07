@@ -43,6 +43,11 @@ if(VOICE_METAL)
 endif()
 if(VOICE_CUDA)
     set(GGML_CUDA_NO_VMM ON CACHE BOOL "" FORCE)     # 不直接依赖 libcuda 的 VMM 接口
+    if(UNIX AND NOT APPLE)
+        # Linux（Jetson）上 cudart / cuBLAS 都静态链进来，只剩驱动的 libcuda.so（运行时 dlopen）。
+        # GGML_STATIC 的 -static 只加在 ggml 自己目录的目标上，不影响我们的可执行文件
+        set(GGML_STATIC ON CACHE BOOL "" FORCE)
+    endif()
 endif()
 
 include(FetchContent)
@@ -186,5 +191,14 @@ if(WIN32)
     target_link_libraries(friday-voice PRIVATE shell32)
 else()
     target_link_libraries(friday-voice PRIVATE Threads::Threads)
+endif()
+if(UNIX AND NOT APPLE)
+    # 不依赖目标机器的 libstdc++ 版本（Jetson 的 JetPack 4 / 6 都比编译环境旧或不同）
+    target_link_options(friday-voice PRIVATE -static-libstdc++ -static-libgcc)
+endif()
+if(VOICE_TTS)
+    # 默认音色随包发，放在可执行文件旁边的 voices/
+    add_custom_command(TARGET friday-voice POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/assets/voices $<TARGET_FILE_DIR:friday-voice>/voices)
 endif()
 install(TARGETS friday-voice RUNTIME DESTINATION bin)

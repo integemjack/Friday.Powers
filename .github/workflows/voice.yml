@@ -1,0 +1,141 @@
+# friday-voice：各平台编译、打包；推 voice-vX.Y.Z 标签时发 Release 并更新 index Release 里的 index.json（Friday 从那里取）。
+name: voice
+
+on:
+  push:
+    branches: [main]
+    tags: ['voice-v*']
+    paths: ['voice/**', '.github/workflows/voice.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: voice-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: ${{ matrix.target }}
+    runs-on: windows-2025
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-x64-vulkan
+            backend: vulkan
+          - target: windows-x64-cuda
+            backend: cuda
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x64
+      - uses: seanmiddleditch/gha-setup-ninja@v6
+      - name: 装 Vulkan SDK
+        if: matrix.backend == 'vulkan'
+        uses: jakoch/install-vulkan-sdk-action@v1.6.0
+        with:
+          install_runtime: false
+          cache: true
+          stripdown: true
+      - name: 装 CUDA 13.0
+        if: matrix.backend == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '13.0.0'
+          method: local
+          log-file-suffix: '${{ matrix.target }}.txt'
+      - name: 编译
+        shell: pwsh
+        run: |
+          $cmakeArgs = @('-S', 'voice', '-B', 'build', '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
+                    '-DGGML_NATIVE=OFF', '-DGGML_AVX2=ON', '-DGGML_FMA=ON', '-DGGML_F16C=ON')
+          if ('${{ matrix.backend }}' -eq 'vulkan') { $cmakeArgs += '-DVOICE_VULKAN=ON' }
+          if ('${{ matrix.backend }}' -eq 'cuda') {
+            $cmakeArgs += @('-DVOICE_CUDA=ON', '-DCMAKE_CUDA_ARCHITECTURES=75-virtual;86-real;89-real;120a-real')
+          }
+          cmake @cmakeArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\build\bin\friday-voice.exe --version
+      - name: 打包
+        shell: pwsh
+        run: |
+          $extra = @()
+          if ('${{ matrix.backend }}' -eq 'cuda') {
+            $extra = Get-ChildItem -Recurse "$env:CUDA_PATH\bin" -Include 'cublas64_*.dll', 'cublasLt64_*.dll' | ForEach-Object FullName
+            if ($extra.Count -lt 2) { throw "没找到 cuBLAS 的 DLL" }
+          }
+          python voice/ci/package.py --target ${{ matrix.target }} --build build --out dist --extra @extra
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  linux:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-arm64-jetson-orin
+            image: nvcr.io/nvidia/l4t-cuda:12.6.11-devel-aarch64-ubuntu22.04
+            setup: >-
+              apt-get update && apt-get install -y --no-install-recommends build-essential ninja-build python3 python3-pip ca-certificates binutils &&
+              pip3 install --no-cache-dir 'cmake>=3.28'
+          - target: linux-arm64-jetson-nano
+            image: quay.io/pypa/manylinux2014_aarch64
+            setup: >-
+              /opt/python/cp312-cp312/bin/pip install --no-cache-dir ninja && ln -sf /opt/python/cp312-cp312/bin/ninja /usr/local/bin/ninja
+          - target: linux-arm64-vulkan
+            image: ubuntu:24.04
+            setup: >-
+              apt-get update && apt-get install -y --no-install-recommends build-essential ninja-build cmake python3 ca-certificates binutils
+              libvulkan-dev glslc
+    steps:
+      - uses: actions/checkout@v7
+      # 在容器里编（Jetson 要 L4T 的 CUDA，Nano 要老 glibc），工作区挂进去
+      - name: 编译
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src ${{ matrix.image }} bash -c \
+            "set -e; ${{ matrix.setup }}; bash voice/ci/build-linux.sh ${{ matrix.target }} build"
+      - name: 打包
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" build
+          python3 voice/ci/package.py --target ${{ matrix.target }} --build build --out dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/voice-v')
+    needs: [windows, linux]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: 发布
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/voice-*.zip dist/voice-*.tar.gz --title "$TAG" \
+            --notes "friday-voice ${TAG#voice-v}：本地 GPU 实时听写 + 边写边读。各平台包见附件，Friday 通过 index 里的 index.json 按需下载。" \
+            || gh release upload "$TAG" dist/voice-*.zip dist/voice-*.tar.gz --clobber
+          # index Release：放所有 Power 的最新 index.json
+          gh release view index >/dev/null 2>&1 || gh release create index --title "index" --notes "Friday 读的 Power 索引（index.json），每次发 Power 时更新。" --latest=false
+          gh release download index -p index.json -D previous || true
+          python3 voice/ci/make_index.py --dist dist --tag "$TAG" --repo "$GITHUB_REPOSITORY" --previous previous/index.json --out index.json
+          gh release upload index index.json --clobber

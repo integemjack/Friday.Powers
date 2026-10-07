@@ -155,6 +155,20 @@ bool parse(int argc, char** argv, Options& o)
     return !o.command.empty();
 }
 
+fs::path executableDir()
+{
+#ifdef _WIN32
+    std::wstring path(32768, L'\0');
+    const DWORD n = GetModuleFileNameW(nullptr, path.data(), DWORD(path.size()));
+    path.resize(n);
+    return fs::path(path).parent_path();
+#else
+    std::error_code ec;
+    const fs::path self = fs::read_symlink("/proc/self/exe", ec);
+    return ec ? fs::current_path() : self.parent_path();
+#endif
+}
+
 /// --models 目录里按惯用文件名找模型
 bool resolveModels(Options& o, std::string* error)
 {
@@ -191,6 +205,12 @@ bool resolveModels(Options& o, std::string* error)
         }
         if (o.voices.empty() && fs::exists(dir / "voices"))
             o.voices = (dir / "voices").u8string();
+    }
+    // 默认音色随包发，在可执行文件旁边的 voices/
+    if (o.voices.empty()) {
+        const fs::path beside = executableDir() / "voices";
+        if (fs::exists(beside))
+            o.voices = beside.u8string();
     }
     if (o.command == "speak")
         return true;   // 只要合成模型

@@ -1,12 +1,17 @@
 // 一路实时听写（一条 WebSocket）：喂音频 → FSMN-VAD 每 10 毫秒判一帧 → 断句状态机 →
 //   说话中每 partialIntervalMs 对这句整段重识别一次出 partial（实时字幕）；说完出 final（带标点）。
 // 协议见 docs/voice-protocol.md。feed 在连接线程调，识别在推理线程跑，结果通过 send 回调发出去（send 要线程安全）。
+// 声纹（start 帧 speaker: true、加载了 campplus）：final 带这句的声纹（speaker，192 维单位向量）；说了 1 秒以上的 partial
+// 每多 0.8 秒也带一次（客户端判断插话的是不是登记过的人）。
 #pragma once
 
 #include "AudioIO.h"
 #include "FsmnVad.h"
 #include "InferenceQueue.h"
 #include "SenseVoice.h"
+#include "SpeakerEncoder.h"
+
+#include "json.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -30,6 +35,7 @@ struct StreamConfig {
     float threshold = 0.6f;   // 一帧算「在说话」的概率门限
     bool partials = true;
     bool itn = true;
+    bool speaker = false;   // final / partial 带上声纹
 };
 
 /// 整段离线断句（一次性听写用，和实时同一套状态机）：每帧概率 → [开始帧, 结束帧) 列表
@@ -43,7 +49,9 @@ class Streamer : public std::enable_shared_from_this<Streamer> {
 public:
     using Send = std::function<void(const std::string& json)>;
 
-    Streamer(SenseVoice& recognizer, const FsmnVad& vad, const Fbank& fbank, InferenceQueue& queue, Send send, int vadThreads);
+    /// voiceprint 可以是空（没装声纹模型）
+    Streamer(SenseVoice& recognizer, const FsmnVad& vad, const Fbank& fbank, InferenceQueue& queue, Send send, int vadThreads,
+             SpeakerEncoder* voiceprint = nullptr);
     ~Streamer();
 
     /// 收到 start 帧时调（只在第一段音频之前有效）
@@ -69,7 +77,11 @@ private:
     void trimBuffer();
     void emit(const std::string& json);
 
+    /// 这段的声纹（JSON 数组，保留 4 位小数）；不要 / 算不了时是 null
+    nlohmann::json voiceprintOf(const std::vector<float>& samples) const;
+
     SenseVoice& m_recognizer;
+    SpeakerEncoder* m_voiceprint;
     InferenceQueue& m_queue;
     Send m_send;
     StreamConfig m_config;
@@ -97,6 +109,8 @@ private:
     std::mutex m_mutex;              // 推理线程回来时要碰的字段
     int m_finalizedThrough = 0;      // 编号 ≤ 这个的句子已经定稿（晚到的 partial 丢掉）
     std::string m_lastPartial;
+    int m_voiceprintSegment = -1;    // partial 上次带声纹的句子和那时的长度（采样）
+    size_t m_voiceprintSamples = 0;
     std::atomic<bool> m_closed { false };
 };
 

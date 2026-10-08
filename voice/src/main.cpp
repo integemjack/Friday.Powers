@@ -18,6 +18,7 @@
 #include "FsmnVad.h"
 #include "Log.h"
 #include "SenseVoice.h"
+#include "SpeakerEncoder.h"
 #include "Server.h"
 #include "Streamer.h"
 #ifdef VOICE_HAS_TTS
@@ -29,11 +30,15 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -59,10 +64,11 @@ namespace {
 struct Options {
     std::string command;
     std::string models, model, vad, device = "auto", host = "127.0.0.1", token, language = "auto", input;
-    std::string ttsModel, voices, text, output, voice, instruction;
+    std::string ttsModel, voices, text, output, voice, instruction, speakerModel, features;
     float speed = 1.0f;
     int port = 0, threads = 0, repeat = 1, chunkTokens = 0;
-    bool parentStdin = false, itn = true, verbose = false, tts = true;
+    bool parentStdin = false, itn = true, verbose = false, tts = true, speaker = true;
+    std::vector<std::string> inputs;
 };
 
 void usage()
@@ -73,9 +79,12 @@ void usage()
                  "                          [--host 127.0.0.1] [--port 0] [--device auto|cpu|cuda[:N]|vulkan[:N]|metal|opencl]\n"
                  "                          [--token T] [--threads N] [--parent-stdin] [--verbose]\n"
                  "                          [--tts-model COSYVOICE3.gguf --voices DIR | --no-tts]\n"
+                 "                          [--speaker-model CAMPPLUS.onnx | --no-speaker]（声纹：每句话 final 带上说话人特征）\n"
                  "  friday-voice transcribe (模型参数同上) [--language auto|zh|en|yue|ja|ko] [--no-itn] [--repeat N] AUDIO\n"
                  "  friday-voice speak      (--models DIR | --tts-model COSYVOICE3.gguf --voices DIR) --text TEXT --output OUT.wav\n"
                  "                          [--voice NAME] [--speed 1.0] [--instruction TEXT] [--repeat N]\n"
+                 "  friday-voice speaker    (--models DIR | --speaker-model CAMPPLUS.onnx) AUDIO [AUDIO2 …]\n"
+                 "                          打印每段的声纹（192 维），两段以上再打印两两的相似度；[--features F.bin] 用这份特征（测试用）\n"
                  "  friday-voice info       [--device …]\n"
                  "  friday-voice --version\n",
                  VOICE_VERSION);
@@ -137,6 +146,12 @@ bool parse(int argc, char** argv, Options& o)
             o.chunkTokens = std::atoi(v.c_str());
         } else if (a == "--no-tts") {
             o.tts = false;
+        } else if (a == "--speaker-model") {
+            if (!next(o.speakerModel)) return false;
+        } else if (a == "--no-speaker") {
+            o.speaker = false;
+        } else if (a == "--features") {
+            if (!next(o.features)) return false;
         } else if (a == "--parent-stdin") {
             o.parentStdin = true;
         } else if (a == "--no-itn") {
@@ -152,6 +167,7 @@ bool parse(int argc, char** argv, Options& o)
             o.command = a;
         } else {
             o.input = a;
+            o.inputs.push_back(a);
         }
     }
     return !o.command.empty();
@@ -213,7 +229,18 @@ bool resolveModels(Options& o, std::string* error)
         }
         if (o.voices.empty() && fs::exists(dir / "voices"))
             o.voices = (dir / "voices").u8string();
+        // 声纹：CosyVoice 模型目录里的 campplus.onnx
+        if (o.speakerModel.empty()) {
+            for (const fs::path& candidate : { dir / "campplus.onnx", dir / "cosyvoice3" / "campplus.onnx" }) {
+                if (fs::exists(candidate)) {
+                    o.speakerModel = candidate.u8string();
+                    break;
+                }
+            }
+        }
     }
+    if (!o.speaker)
+        o.speakerModel.clear();
     // 默认音色随包发，在可执行文件旁边的 voices/
     if (o.voices.empty()) {
         const fs::path beside = executableDir() / "voices";
@@ -222,6 +249,11 @@ bool resolveModels(Options& o, std::string* error)
     }
     if (o.command == "speak")
         return true;   // 只要合成模型
+    if (o.command == "speaker") {
+        if (o.speakerModel.empty() && error)
+            *error = "要给声纹模型：--models <目录> 或 --speaker-model campplus.onnx";
+        return !o.speakerModel.empty();
+    }
     if (o.model.empty() || o.vad.empty()) {
         if (error)
             *error = "要给识别模型和 VAD 模型：--models <目录> 或 --model … --vad …";
@@ -312,6 +344,58 @@ int runSpeak(const Options& o, const voice::Backend& backend)
 }
 #endif
 
+/// friday-voice speaker：每段录音的声纹（JSON 一行一个），两段以上打印两两的余弦相似度（调阈值、核对数值用）
+int runSpeaker(const Options& o, voice::Backend& backend)
+{
+    voice::SpeakerEncoder encoder(backend);
+    std::string error;
+    if (!encoder.load(o.speakerModel, &error)) {
+        VLOG_ERROR("%s", error.c_str());
+        return 3;
+    }
+    std::vector<std::vector<float>> vectors;
+    if (!o.features.empty()) {
+        // 测试：直接用给的特征（frames×80 的 float32，小端）
+        std::ifstream in(fs::u8path(o.features), std::ios::binary);
+        const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        std::vector<float> values(bytes.size() / 4);
+        std::memcpy(values.data(), bytes.data(), values.size() * 4);
+        const voice::SpeakerEmbedding e = encoder.embedFeatures(values, int(values.size() / 80));
+        if (!e.ok) {
+            VLOG_ERROR("%s", e.error.c_str());
+            return 5;
+        }
+        std::printf("%s\n", json { { "features", o.features }, { "embedding", e.vector }, { "seconds", e.seconds } }.dump().c_str());
+        return 0;
+    }
+    if (o.inputs.empty()) {
+        usage();
+        return 2;
+    }
+    for (const std::string& path : o.inputs) {
+        std::vector<float> pcm;
+        if (!voice::decodeAudioFile(path, pcm, &error)) {
+            VLOG_ERROR("%s", error.c_str());
+            return 4;
+        }
+        voice::SpeakerEmbedding e;
+        for (int i = 0; i < o.repeat; ++i)
+            e = encoder.embed(pcm.data(), pcm.size());
+        if (!e.ok) {
+            VLOG_ERROR("%s：%s", path.c_str(), e.error.c_str());
+            return 5;
+        }
+        VLOG_INFO("%s：%.2f 秒录音，声纹用时 %.3f 秒", path.c_str(), e.audioSeconds, e.seconds);
+        std::printf("%s\n", json { { "file", path }, { "embedding", e.vector }, { "seconds", e.seconds } }.dump().c_str());
+        vectors.push_back(e.vector);
+    }
+    for (size_t i = 0; i < vectors.size(); ++i)
+        for (size_t j = i + 1; j < vectors.size(); ++j)
+            std::printf("%s\n", json { { "a", o.inputs[i] }, { "b", o.inputs[j] }, { "similarity", voice::SpeakerEncoder::cosine(vectors[i], vectors[j]) } }.dump().c_str());
+    std::fflush(stdout);
+    return 0;
+}
+
 std::atomic<bool> g_stop { false };
 std::mutex g_stopMutex;
 std::condition_variable g_stopWake;
@@ -376,7 +460,7 @@ int main(int argc, char** argv)
         return ok ? 0 : 1;
     }
 
-    if (o.command != "serve" && o.command != "transcribe" && o.command != "speak") {
+    if (o.command != "serve" && o.command != "transcribe" && o.command != "speak" && o.command != "speaker") {
         usage();
         return 2;
     }
@@ -390,6 +474,8 @@ int main(int argc, char** argv)
         VLOG_ERROR("%s", error.c_str());
         return 3;
     }
+    if (o.command == "speaker")
+        return runSpeaker(o, backend);
     if (o.command == "speak") {
 #ifdef VOICE_HAS_TTS
         return runSpeak(o, backend);
@@ -455,11 +541,19 @@ int main(int argc, char** argv)
         VLOG_INFO("没找到合成模型，只开听写");
     }
 #endif
+    std::unique_ptr<voice::SpeakerEncoder> voiceprint;
+    if (!o.speakerModel.empty()) {
+        voiceprint = std::make_unique<voice::SpeakerEncoder>(backend);
+        if (!voiceprint->load(o.speakerModel, &error)) {
+            VLOG_WARN("声纹用不了：%s", error.c_str());
+            voiceprint.reset();
+        }
+    }
     voice::ServerOptions options;
     options.host = o.host;
     options.port = o.port;
     options.token = o.token;
-    voice::Server server(backend, recognizer, vad, synthesizer, options);
+    voice::Server server(backend, recognizer, vad, synthesizer, options, voiceprint.get());
     if (!server.start(&error)) {
         VLOG_ERROR("%s", error.c_str());
         return 6;
@@ -469,6 +563,13 @@ int main(int argc, char** argv)
         std::vector<float> silence(voice::kSampleRate, 0.0f);
         const voice::Transcript warm = recognizer.transcribe(silence.data(), silence.size(), "auto", true);
         VLOG_INFO("预热完成：%.3f 秒", warm.seconds);
+    }
+    if (voiceprint) {
+        std::vector<float> noise(voice::kSampleRate);
+        for (size_t i = 0; i < noise.size(); ++i)
+            noise[i] = 0.01f * float(std::sin(double(i) * 0.05));
+        const voice::SpeakerEmbedding warm = voiceprint->embed(noise.data(), noise.size());
+        VLOG_INFO("声纹预热完成：%.3f 秒", warm.seconds);
     }
 #ifdef VOICE_HAS_TTS
     if (synthesizer) {

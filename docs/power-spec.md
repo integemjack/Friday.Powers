@@ -59,6 +59,6 @@ target 命名：`<os>-<arch>-<加速>`。Friday 按本机情况挑：NVIDIA 优�
 | `speech` | `POST /v1/audio/speech`（OpenAI 兼容） | 合成，边合成边分块返回（wav / pcm） |
 | `realtimeSpeech` | `GET /v1/realtime/speak`（WebSocket） | 边写边读：文字流进去、音频流出来，可打断，见 `voice-protocol.md` |
 
-`speech` / `realtimeSpeech` 只在装了合成模型（CosyVoice3 + 至少一个音色）时出现在 `/v1/info` 的 `capabilities` 里。
+`speech` / `realtimeSpeech` 只在装了合成模型（CosyVoice3 + 至少一个音色）时出现在 `/v1/info` 的 `capabilities` 里。`speakerEmbedding`（声纹，v0.2）只在装了 `campplus.onnx` 时出现。
 
 `GET /v1/info` 返回 Power 的 id、版本、能力、设备、已加载的模型。

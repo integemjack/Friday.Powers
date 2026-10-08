@@ -22,6 +22,8 @@ Friday 主程序只接在线模型、保持小巧；要用到本机 GPU 的重�
 - **实时听写**：SenseVoice-Small + FSMN-VAD。边说边出字幕，一句说完马上给出带标点的定稿（RTX 5080 上一句约 40 毫秒）。
 - **边写边读**：CosyVoice3（[cosyvoice.cpp](https://github.com/Lourdle/cosyvoice.cpp)）。大模型边出字，服务端攒够一句就合成、
   音频边出边发，随时可以打断（5080 上实时率约 0.22，第一块音频约 250 毫秒）。
+- **声纹**（v0.2）：CAM++（CosyVoice 自带的 campplus.onnx，ggml 上跑，权重直接读 ONNX，和 onnxruntime 结果一致）。实时听写的每句话带上
+  说话人特征，Friday 的语音模式据此只听登记过的人：旁边的人说话不交给助手、也不打断它（5080 上一句约 10 毫秒）。
 - 用在 Friday 的：桌面端语音模式、助手的 SChat 通话、会议 / 听课的连续听写 + 逐句分析。
 
 | 平台 | 加速 | 说明 |

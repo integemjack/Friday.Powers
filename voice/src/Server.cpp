@@ -1,5 +1,7 @@
 #include "Server.h"
 
+#include "SpeakerEncoder.h"
+
 #include "Log.h"
 #include "Streamer.h"
 #ifdef VOICE_HAS_TTS
@@ -113,6 +115,7 @@ int infoHandler(mg_connection* conn, void* data) { return static_cast<Server*>(d
 int modelsHandler(mg_connection* conn, void* data) { return static_cast<Server*>(data)->handleModels(conn); }
 int transcriptionsHandler(mg_connection* conn, void* data) { return static_cast<Server*>(data)->handleTranscriptions(conn); }
 int speechHandler(mg_connection* conn, void* data) { return static_cast<Server*>(data)->handleSpeech(conn); }
+int speakerHandler(mg_connection* conn, void* data) { return static_cast<Server*>(data)->handleSpeaker(conn); }
 int socketConnect(const mg_connection* conn, void* data) { return static_cast<Server*>(data)->authorized(conn) ? 0 : 1; }
 void socketReady(mg_connection* conn, void* data) { static_cast<Server*>(data)->onSocketReady(conn); }
 void speakSocketReady(mg_connection* conn, void* data) { static_cast<Server*>(data)->onSpeakSocketReady(conn); }
@@ -130,8 +133,9 @@ int logMessage(const mg_connection*, const char* message)
 
 } // namespace
 
-Server::Server(Backend& backend, SenseVoice& recognizer, FsmnVad& vad, Synthesizer* synthesizer, const ServerOptions& options)
-    : m_backend(backend), m_recognizer(recognizer), m_vad(vad), m_synth(synthesizer), m_options(options)
+Server::Server(Backend& backend, SenseVoice& recognizer, FsmnVad& vad, Synthesizer* synthesizer, const ServerOptions& options,
+               SpeakerEncoder* voiceprint)
+    : m_backend(backend), m_recognizer(recognizer), m_vad(vad), m_synth(synthesizer), m_voiceprint(voiceprint), m_options(options)
 {
 }
 
@@ -174,6 +178,8 @@ bool Server::start(std::string* error)
     mg_set_request_handler(m_ctx, "/v1/models", modelsHandler, this);
     mg_set_request_handler(m_ctx, "/v1/audio/transcriptions", transcriptionsHandler, this);
     mg_set_websocket_handler(m_ctx, "/v1/realtime/transcribe", socketConnect, socketReady, socketData, socketClose, this);
+    if (m_voiceprint)
+        mg_set_request_handler(m_ctx, "/v1/audio/speaker", speakerHandler, this);
     if (m_synth) {
         mg_set_request_handler(m_ctx, "/v1/audio/speech", speechHandler, this);
         mg_set_websocket_handler(m_ctx, "/v1/realtime/speak", socketConnect, speakSocketReady, socketData, socketClose, this);
@@ -226,6 +232,10 @@ int Server::handleInfo(mg_connection* conn)
     const DeviceInfo& d = m_backend.device();
     json capabilities = { "transcription", "realtimeTranscription" };
     json models = { { "asr", m_recognizer.path() }, { "asr_bytes", m_recognizer.weightsBytes() } };
+    if (m_voiceprint) {
+        capabilities.push_back("speakerEmbedding");
+        models["speaker"] = m_voiceprint->path();
+    }
 #ifdef VOICE_HAS_TTS
     if (m_synth) {
         capabilities.push_back("speech");
@@ -258,7 +268,57 @@ int Server::handleModels(mg_connection* conn)
     data.push_back({ { "id", "sensevoice-small" }, { "object", "model" }, { "owned_by", "friday-powers" } });
     if (m_synth)
         data.push_back({ { "id", "cosyvoice3" }, { "object", "model" }, { "owned_by", "friday-powers" } });
+    if (m_voiceprint)
+        data.push_back({ { "id", "campplus" }, { "object", "model" }, { "owned_by", "friday-powers" } });
     reply(conn, 200, json { { "object", "list" }, { "data", data } }.dump());
+    return 200;
+}
+
+int Server::handleSpeaker(mg_connection* conn)
+{
+    if (!authorized(conn)) {
+        replyError(conn, 401, "unauthorized");
+        return 401;
+    }
+    const mg_request_info* info = mg_get_request_info(conn);
+    if (!info || std::strcmp(info->request_method, "POST") != 0) {
+        replyError(conn, 405, "use POST multipart/form-data");
+        return 405;
+    }
+    struct Form {
+        std::map<std::string, std::string> fields;
+        std::string current;
+    } form;
+    mg_form_data_handler handler {};
+    handler.field_found = [](const char* key, const char*, char*, size_t, void* user) -> int {
+        static_cast<Form*>(user)->current = key ? key : "";
+        return MG_FORM_FIELD_STORAGE_GET;
+    };
+    handler.field_get = [](const char* key, const char* value, size_t size, void* user) -> int {
+        auto& f = *static_cast<Form*>(user);
+        const std::string name = key && *key ? std::string(key) : f.current;
+        if (value && !name.empty())
+            f.fields[name].append(value, size);
+        return MG_FORM_FIELD_HANDLE_GET;
+    };
+    handler.user_data = &form;
+    if (mg_handle_form_request(conn, &handler) < 0 || form.fields["file"].empty()) {
+        replyError(conn, 400, "missing multipart field 'file'");
+        return 400;
+    }
+    std::vector<float> pcm;
+    std::string error;
+    if (!decodeAudio(form.fields["file"].data(), form.fields["file"].size(), pcm, &error)) {
+        replyError(conn, 400, error);
+        return 400;
+    }
+    const SpeakerEmbedding e = m_voiceprint->embed(pcm.data(), pcm.size());
+    if (!e.ok) {
+        replyError(conn, 400, e.error);
+        return 400;
+    }
+    VLOG_INFO("声纹：%.1f 秒录音，用时 %.3f 秒", e.audioSeconds, e.seconds);
+    reply(conn, 200, json { { "embedding", e.vector }, { "dim", e.vector.size() }, { "duration", pcm.size() / double(kSampleRate) } }.dump());
     return 200;
 }
 
@@ -474,11 +534,11 @@ void Server::onSocketReady(mg_connection* conn)
     auto* session = new Session;
     session->io = io;
     session->streamer = std::make_shared<Streamer>(m_recognizer, m_vad, m_fbank, m_queue,
-                                                   [io](const std::string& text) { io->send(text); }, m_options.vadThreads);
+                                                   [io](const std::string& text) { io->send(text); }, m_options.vadThreads, m_voiceprint);
     mg_set_user_connection_data(conn, session);
     const DeviceInfo& d = m_backend.device();
     io->send(json { { "type", "ready" }, { "model", "sensevoice-small" }, { "device", d.backend + " " + d.description },
-                    { "sample_rate", kSampleRate } }
+                    { "sample_rate", kSampleRate }, { "speaker", m_voiceprint != nullptr } }
                  .dump());
     VLOG_INFO("实时听写连接");
 }
@@ -539,6 +599,7 @@ int Server::onSocketData(mg_connection* conn, int bits, char* data, size_t size)
         config.threshold = message.value("vad_threshold", config.threshold);
         config.partials = message.value("partials", config.partials);
         config.itn = message.value("itn", config.itn);
+        config.speaker = message.value("speaker", config.speaker) && m_voiceprint;
         session->streamer->configure(config);
     } else if (type == "flush") {
         session->streamer->flush();

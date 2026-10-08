@@ -1,4 +1,5 @@
 // FunASR 口径的 80 维 log-mel fbank（SenseVoice 和 FSMN-VAD 共用）+ LFR 拼帧。
+// 声纹（CAM++，SpeakerEncoder）用 Kaldi 默认的 povey 窗（torchaudio.compliance.kaldi.fbank），其余同。
 // 数值细节照 FunASR llama.cpp runtime（funasr-sensevoice.cpp / funasr_vad.h）：×32768、帧内去均值、0.97 预加重、
 // 汉明窗、512 点 FFT、20–8000 Hz 三角滤波器、log 下限 1.19e-7。滤波器组和 FFT 旋转因子只算一次。
 #pragma once
@@ -16,7 +17,9 @@ public:
     static constexpr int kFft = 512;
     static constexpr int kMel = 80;
 
-    Fbank();
+    enum class Window { Hamming, Povey };
+
+    explicit Fbank(Window window = Window::Hamming);
 
     /// 一帧：samples 指向 kWindow 个采样（[-1,1]），out 写 kMel 个值
     void frame(const float* samples, float* out) const;

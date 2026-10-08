@@ -6,6 +6,7 @@
 //   GET  /v1/realtime/transcribe    WebSocket 实时听写（docs/voice-protocol.md）
 //   POST /v1/audio/speech           OpenAI 兼容的合成（JSON：input、voice、speed、response_format wav|pcm、instructions），边合成边流式返回
 //   GET  /v1/realtime/speak         WebSocket 边写边读（docs/voice-protocol.md）
+//   POST /v1/audio/speaker          一段录音的声纹（multipart：file）→ {embedding: 192 维单位向量, duration}；登记声纹用
 #pragma once
 
 #include "Backend.h"
@@ -23,6 +24,7 @@ struct mg_connection;
 namespace voice {
 
 class Synthesizer;
+class SpeakerEncoder;
 
 struct ServerOptions {
     std::string host = "127.0.0.1";
@@ -34,8 +36,9 @@ struct ServerOptions {
 
 class Server {
 public:
-    /// synthesizer 可以是空（没装合成模型时只有听写）
-    Server(Backend& backend, SenseVoice& recognizer, FsmnVad& vad, Synthesizer* synthesizer, const ServerOptions& options);
+    /// synthesizer、voiceprint 可以是空（没装合成 / 声纹模型时没有这些功能）
+    Server(Backend& backend, SenseVoice& recognizer, FsmnVad& vad, Synthesizer* synthesizer, const ServerOptions& options,
+           SpeakerEncoder* voiceprint = nullptr);
     ~Server();
 
     bool start(std::string* error);
@@ -49,6 +52,7 @@ public:
     int handleModels(mg_connection* conn);
     int handleTranscriptions(mg_connection* conn);
     int handleSpeech(mg_connection* conn);
+    int handleSpeaker(mg_connection* conn);
     bool authorized(const mg_connection* conn) const;
     void onSocketReady(mg_connection* conn);
     void onSpeakSocketReady(mg_connection* conn);
@@ -60,6 +64,7 @@ private:
     SenseVoice& m_recognizer;
     FsmnVad& m_vad;
     Synthesizer* m_synth;
+    SpeakerEncoder* m_voiceprint;
     Fbank m_fbank;
     InferenceQueue m_queue;
     ServerOptions m_options;

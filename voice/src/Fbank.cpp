@@ -19,11 +19,14 @@ constexpr float kFloor = 1.1920929e-07f;
 inline float mel(float hz) { return 1127.0f * std::log(1.0f + hz / 700.0f); }
 } // namespace
 
-Fbank::Fbank()
+Fbank::Fbank(Window window)
 {
     m_window.resize(kWindow);
-    for (int i = 0; i < kWindow; ++i)
-        m_window[i] = 0.54f - 0.46f * std::cos(2.0f * float(M_PI) * i / (kWindow - 1));
+    for (int i = 0; i < kWindow; ++i) {
+        const double hann = 0.5 - 0.5 * std::cos(2.0 * M_PI * i / (kWindow - 1));
+        m_window[i] = window == Window::Povey ? float(std::pow(hann, 0.85))
+                                              : 0.54f - 0.46f * std::cos(2.0f * float(M_PI) * i / (kWindow - 1));
+    }
 
     const int bins = kFft / 2 + 1;
     const float binHz = float(kSampleRate) / kFft;

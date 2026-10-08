@@ -6,7 +6,7 @@
 #   cmake -B build -G Ninja -DVOICE_CUDA=ON          # 或 -DVOICE_VULKAN=ON，可同时开
 #   cmake --build build                               # 产物 build/bin/friday-voice
 cmake_minimum_required(VERSION 3.24)
-project(friday-voice VERSION 0.1.0 LANGUAGES C CXX)
+project(friday-voice VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -186,6 +186,8 @@ add_executable(friday-voice
     src/FsmnVad.cpp
     src/Streamer.cpp
     src/AudioIO.cpp
+    src/OnnxWeights.cpp
+    src/SpeakerEncoder.cpp
     src/Server.cpp)
 target_include_directories(friday-voice PRIVATE src ${VOICE_HEADER_DIR})
 target_compile_definitions(friday-voice PRIVATE

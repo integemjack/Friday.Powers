@@ -12,7 +12,8 @@
   - `{"type":"start","sample_rate":16000,"language":"auto","partial_interval_ms":300,"end_silence_ms":450}`
     —— 可选，在第一段音频之前发；`language` 取 `auto|zh|en|yue|ja|ko`；不发就用默认值。
     `sample_rate` 不是 16000 时服务端自己重采样。其他可选字段：`max_segment_ms`（默认 20000）、
-    `vad_threshold`（默认 0.6）、`partials`（默认 true）、`itn`（标点和数字，默认 true）。
+    `vad_threshold`（默认 0.6）、`partials`（默认 true）、`itn`（标点和数字，默认 true）、
+    `speaker`（默认 false：true 时 final / partial 带这句的声纹，见下文「声纹」；`ready.speaker` 为 false 时没有声纹模型、这个字段不起作用）。
   - `{"type":"flush"}` —— 正在说的这句马上定稿（比如用户按了「说完了」）。
   - `{"type":"stop"}` —— 算完剩下的、正在说的定稿。
 
@@ -20,10 +21,10 @@
 
 | type | 字段 | 说明 |
 |---|---|---|
-| `ready` | `model`, `device`, `sample_rate` | 连上、模型就绪 |
+| `ready` | `model`, `device`, `sample_rate`, `speaker` | 连上、模型就绪；`speaker`：有没有声纹模型 |
 | `speech_start` | `segment`, `start_ms` | 检测到开口（打断助手用） |
-| `partial` | `segment`, `text` | 这句目前听到的（实时字幕），只在变了时发 |
-| `final` | `segment`, `text`, `start_ms`, `end_ms`, `language`, `emotion`, `event`, `latency_ms`, `infer_ms` | 一句说完：带标点的定稿；`latency_ms` = 判定说完到出结果 |
+| `partial` | `segment`, `text`, `speaker`? | 这句目前听到的（实时字幕），只在变了时发 |
+| `final` | `segment`, `text`, `start_ms`, `end_ms`, `language`, `emotion`, `event`, `latency_ms`, `infer_ms`, `speaker`? | 一句说完：带标点的定稿；`latency_ms` = 判定说完到出结果 |
 | `speech_end` | `segment` | 这句没听出字（噪音、咳嗽）时代替 final |
 | `error` | `message` | |
 
@@ -36,6 +37,13 @@
 - 说话中每 `partial_interval_ms` 对这句已有的录音整段重识别一次出 `partial`（SenseVoice 非自回归，5080 上一次约 40 毫秒）；
   刚开口那零点几秒模型常把气声猜成「Yeah.」之类，这种不发；
 - 说完那一刻对整句识别一次（带逆文本正则化：标点、数字）出 `final`。
+
+### 声纹（v0.2，`start.speaker: true`）
+
+- 模型：CAM++（3D-Speaker，CosyVoice 带的 `campplus.onnx`，ggml 上跑，权重直接读 ONNX）；`speaker` 是 192 维单位向量（保留 4 位小数），
+  两句的点积就是余弦相似度：同一个人 3 秒左右的一句一般 0.7–0.98，不同人一般 < 0.3；1 秒左右的短句不稳（同一个人 0.4–0.7）。
+- `final` 带整句的声纹（不到 0.5 秒的不带）；`partial` 说到 1 秒以上时带、之后每多 0.8 秒再带一次（判断插话的是不是登记过的人）。
+- 登记：几段录音分别 `POST /v1/audio/speaker` 取平均再归一化，比一句准；比较、阈值由客户端定（Friday：默认 0.45，短句放宽）。
 
 ## 二、边写边读 `GET /v1/realtime/speak`
 
@@ -74,6 +82,8 @@
 ## 三、一次性接口（OpenAI 兼容）
 
 - `POST /v1/audio/transcriptions`（multipart：`file`、`language`、`response_format` = `json|text|verbose_json`）。
+- `POST /v1/audio/speaker`（multipart：`file`）→ `{"embedding": [192 维单位向量], "dim": 192, "duration": 秒}`：一段录音的声纹（登记用；
+  不到 0.5 秒回 400；超过 20 秒只用中间 20 秒）。只在装了声纹模型时有（`/v1/info` 的 `capabilities` 有 `speakerEmbedding`）。
 - `POST /v1/audio/speech`（JSON：`input`、`voice`、`speed`、`instructions`、`response_format` = `wav|pcm`，额外的 `sample_rate`）：
   分块传输，边合成边返回；`wav` 的长度字段写成最大值（流式 WAV）；要 mp3 等也给 wav（没带编码器）；
   认不出的音色名（`alloy` 等）用默认音色。

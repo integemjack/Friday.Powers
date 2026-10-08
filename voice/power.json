@@ -2,7 +2,7 @@
   "schema": 1,
   "id": "voice",
   "title": "本地语音",
-  "detail": "用本机 GPU 实时听写（边说边出字幕，说完一句出带标点的定稿）和边写边读（大模型边出字边念，可打断）；不联网、不花钱。",
+  "detail": "用本机 GPU 实时听写（边说边出字幕，说完一句出带标点的定稿）和边写边读（大模型边出字边念，可打断）、声纹（只认登记过的人说的话）；不联网、不花钱。",
   "executable": "friday-voice",
   "serve": [
     "serve",
@@ -20,7 +20,8 @@
     "transcription",
     "realtimeTranscription",
     "speech",
-    "realtimeSpeech"
+    "realtimeSpeech",
+    "speakerEmbedding"
   ],
   "models": [
     {
@@ -58,6 +59,15 @@
       "size": 629141792,
       "purpose": "合成（Fun-CosyVoice3-0.5B，Q4_K_M，省显存）",
       "license": "Apache-2.0"
+    },
+    {
+      "id": "campplus",
+      "file": "campplus.onnx",
+      "url": "https://modelscope.cn/models/FunAudioLLM/Fun-CosyVoice3-0.5B-2512/resolve/master/campplus.onnx",
+      "sha256": "a6ac6a63997761ae2997373e2ee1c47040854b4b759ea41ec48e4e42df0f4d73",
+      "size": 28303423,
+      "purpose": "声纹（CAM++，只认登记过的人说的话）",
+      "license": "Apache-2.0"
     }
   ],
   "targets": {
@@ -66,7 +76,8 @@
       "models": [
         "sensevoice-small-q8",
         "fsmn-vad",
-        "cosyvoice3-q8"
+        "cosyvoice3-q8",
+        "campplus"
       ]
     },
     "windows-x64-cuda": {
@@ -74,7 +85,8 @@
       "models": [
         "sensevoice-small-q8",
         "fsmn-vad",
-        "cosyvoice3-q8"
+        "cosyvoice3-q8",
+        "campplus"
       ]
     },
     "macos-arm64-metal": {
@@ -82,7 +94,8 @@
       "models": [
         "sensevoice-small-q8",
         "fsmn-vad",
-        "cosyvoice3-q8"
+        "cosyvoice3-q8",
+        "campplus"
       ]
     },
     "linux-arm64-jetson-orin": {
@@ -90,14 +103,16 @@
       "models": [
         "sensevoice-small-q8",
         "fsmn-vad",
-        "cosyvoice3-q4km"
+        "cosyvoice3-q4km",
+        "campplus"
       ]
     },
     "linux-arm64-jetson-nano": {
       "detail": "初代 Jetson Nano（JetPack 4）：只用 CPU 听写，合成用在线服务",
       "models": [
         "sensevoice-small-q8",
-        "fsmn-vad"
+        "fsmn-vad",
+        "campplus"
       ],
       "capabilities": [
         "transcription",
@@ -109,7 +124,8 @@
       "models": [
         "sensevoice-small-q8",
         "fsmn-vad",
-        "cosyvoice3-q8"
+        "cosyvoice3-q8",
+        "campplus"
       ]
     }
   }

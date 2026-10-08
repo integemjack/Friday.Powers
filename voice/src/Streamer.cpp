@@ -4,6 +4,8 @@
 
 #include "json.hpp"
 
+#include <cmath>
+
 #include <algorithm>
 #include <cctype>
 
@@ -190,8 +192,10 @@ std::string transcribeWhole(SenseVoice& recognizer, const FsmnVad& vad, const Fb
     return text;
 }
 
-Streamer::Streamer(SenseVoice& recognizer, const FsmnVad& vad, const Fbank& fbank, InferenceQueue& queue, Send send, int vadThreads)
+Streamer::Streamer(SenseVoice& recognizer, const FsmnVad& vad, const Fbank& fbank, InferenceQueue& queue, Send send, int vadThreads,
+                   SpeakerEncoder* voiceprint)
     : m_recognizer(recognizer)
+    , m_voiceprint(voiceprint)
     , m_queue(queue)
     , m_send(std::move(send))
     , m_vad(std::make_unique<VadStream>(vad, fbank, vadThreads))
@@ -321,10 +325,12 @@ void Streamer::endSegment(int endFrame, const char* reason)
             VLOG_DEBUG("第 %d 句不算说话：%s [%s/%s]", segment, t.text.c_str(), t.emotion.c_str(), t.event.c_str());
             self->emit(json { { "type", "speech_end" }, { "segment", segment } }.dump());
         } else {
-            self->emit(json { { "type", "final" }, { "segment", segment }, { "text", t.text }, { "start_ms", startMs }, { "end_ms", endMs },
-                              { "language", t.language }, { "emotion", t.emotion }, { "event", t.event },
-                              { "latency_ms", latency }, { "infer_ms", int64_t(t.seconds * 1000) } }
-                           .dump());
+            json final { { "type", "final" }, { "segment", segment }, { "text", t.text }, { "start_ms", startMs }, { "end_ms", endMs },
+                         { "language", t.language }, { "emotion", t.emotion }, { "event", t.event },
+                         { "latency_ms", latency }, { "infer_ms", int64_t(t.seconds * 1000) } };
+            if (json speaker = self->voiceprintOf(samples); !speaker.is_null())
+                final["speaker"] = std::move(speaker);
+            self->emit(final.dump());
         }
     });
 }
@@ -346,14 +352,27 @@ void Streamer::submitPartial()
                    t.language.c_str(), t.emotion.c_str(), t.event.c_str());
         if (!t.ok || t.text.empty())
             return;
+        bool withVoiceprint = false;
         {
             std::lock_guard<std::mutex> lock(self->m_mutex);
             // 定稿和实时字幕在同一条推理线程上排队，不会同时跑：这里看到还没定稿，就一定在定稿之前发出去
             if (segment <= self->m_finalizedThrough || t.text == self->m_lastPartial || !worthShowing(t, self->m_lastPartial.empty()))
                 return;
             self->m_lastPartial = t.text;
+            // 声纹：说到 1 秒以上、比上次带的时候又多了 0.8 秒
+            if (self->m_config.speaker && samples.size() >= size_t(kSampleRate)
+                && (self->m_voiceprintSegment != segment || samples.size() >= self->m_voiceprintSamples + size_t(kSampleRate * 8 / 10))) {
+                self->m_voiceprintSegment = segment;
+                self->m_voiceprintSamples = samples.size();
+                withVoiceprint = true;
+            }
         }
-        self->emit(json { { "type", "partial" }, { "segment", segment }, { "text", t.text } }.dump());
+        json partial { { "type", "partial" }, { "segment", segment }, { "text", t.text } };
+        if (withVoiceprint) {
+            if (json speaker = self->voiceprintOf(samples); !speaker.is_null())
+                partial["speaker"] = std::move(speaker);
+        }
+        self->emit(partial.dump());
     });
 }
 
@@ -388,6 +407,21 @@ void Streamer::close()
 {
     m_closed = true;
     m_queue.cancelPartial(m_key);
+}
+
+json Streamer::voiceprintOf(const std::vector<float>& samples) const
+{
+    if (!m_config.speaker || !m_voiceprint || !m_voiceprint->loaded())
+        return nullptr;
+    const SpeakerEmbedding e = m_voiceprint->embed(samples.data(), samples.size());
+    if (!e.ok) {
+        VLOG_DEBUG("声纹没算：%s", e.error.c_str());
+        return nullptr;
+    }
+    json values = json::array();
+    for (const float v : e.vector)
+        values.push_back(std::round(double(v) * 1e4) / 1e4);
+    return values;
 }
 
 void Streamer::emit(const std::string& message)

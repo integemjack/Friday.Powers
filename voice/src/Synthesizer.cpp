@@ -56,6 +56,10 @@ bool Synthesizer::load(const std::string& modelPath, const std::string& voicesDi
         COSYVOICE_MAKE_SEPARATE_KV_CACHE(COSYVOICE_KV_CACHE_TYPE_Q8_0, COSYVOICE_KV_CACHE_TYPE_Q4_0, COSYVOICE_KV_CACHE_TYPE_Q8_0);
     params.base_params.dit_allow_kv_cache_fallback = true;
     params.strict_seed_mode = false;   // 不要求同一种子逐位相同，省一次预填充
+    // Metal 上 LLM 的 flash attention 算错（2026-10-08，M1 + ggml v0.26.0：念出来是乱语、一直念到长度上限，KV 缓存换 F16 也一样；
+    // 关掉就对了）。flow 的 flash attention 没问题，留着（全关更慢）
+    if (m_backend.isMetal())
+        params.base_params.base_params.base_params.llm_use_flash_attn = false;
     m_ctx = cosyvoice_load_from_file_ext(modelPath.c_str(), &params.base_params.base_params.base_params, backend,
                                          uint32_t(m_backend.threads()), COSYVOICE_CONTEXT_PARAMS_V4_VERSION);
     if (!m_ctx) {

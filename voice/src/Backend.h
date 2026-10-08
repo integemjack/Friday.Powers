@@ -41,6 +41,8 @@ public:
     const DeviceInfo& device() const { return m_device; }
     int threads() const { return m_threads; }
     bool usesGpu() const { return m_gpu != nullptr; }
+    /// 用的是 Metal（Apple）
+    bool isMetal() const;
 
 private:
     ggml_backend_t m_gpu = nullptr;

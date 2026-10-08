@@ -40,6 +40,13 @@ DeviceInfo describe(ggml_backend_dev_t dev)
     return info;
 }
 
+/// 后端名（小写）；Metal 注册的名字是 MTL，统一叫 metal（--device metal、auto 的排序都按它认）
+std::string backendKey(ggml_backend_dev_t dev)
+{
+    const std::string name = lower(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)));
+    return name == "mtl" ? std::string("metal") : name;
+}
+
 bool isGpu(ggml_backend_dev_t dev)
 {
     const auto type = ggml_backend_dev_type(dev);
@@ -49,7 +56,7 @@ bool isGpu(ggml_backend_dev_t dev)
 /// auto 的优先顺序：CUDA 最快；其次 Vulkan（独显优先于核显）；Metal；OpenCL
 int score(ggml_backend_dev_t dev)
 {
-    const std::string backend = lower(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)));
+    const std::string backend = backendKey(dev);
     const bool discrete = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU;
     int base = 0;
     if (backend.find("cuda") != std::string::npos)
@@ -108,7 +115,7 @@ bool Backend::init(const std::string& wantRaw, int threads, std::string* error)
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
             if (!isGpu(dev))
                 continue;
-            const std::string backend = lower(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)));
+            const std::string backend = backendKey(dev);
             if (want != "auto" && backend.find(want) == std::string::npos)
                 continue;
             candidates.push_back(dev);
@@ -148,6 +155,11 @@ bool Backend::init(const std::string& wantRaw, int threads, std::string* error)
     }
     VLOG_INFO("计算设备：%s %s（%s）", m_device.backend.c_str(), m_device.name.c_str(), m_device.description.c_str());
     return true;
+}
+
+bool Backend::isMetal() const
+{
+    return m_gpu && backendKey(ggml_backend_get_device(m_gpu)) == "metal";
 }
 
 ggml_backend_buffer_type_t Backend::weightsBufferType() const

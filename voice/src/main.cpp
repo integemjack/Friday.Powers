@@ -9,6 +9,7 @@
 //   friday-voice info       [--device …]
 //
 // 合成模型可选：--models 目录下有 cosyvoice3/CosyVoice3*.gguf 和 voices/*.gguf 时 serve 顺带开合成（--no-tts 关掉）。
+// v0.3 Whisper 可选：--models 目录下有 whisper/ggml-*.bin（或 --whisper-model 指定）时，听写的定稿交给它（中英混说准；--no-whisper 关掉）。
 //   friday-voice --version
 //
 // serve 就绪后在 stdout 打一行 {"event":"listening","url":"http://127.0.0.1:端口"}；--parent-stdin 时 stdin 关了就退出
@@ -21,6 +22,7 @@
 #include "SpeakerEncoder.h"
 #include "Server.h"
 #include "Streamer.h"
+#include "WhisperRecognizer.h"
 #ifdef VOICE_HAS_TTS
 #include "Synthesizer.h"
 #include "TextSplitter.h"
@@ -64,10 +66,10 @@ namespace {
 struct Options {
     std::string command;
     std::string models, model, vad, device = "auto", host = "127.0.0.1", token, language = "auto", input;
-    std::string ttsModel, voices, text, output, voice, instruction, speakerModel, features;
+    std::string ttsModel, voices, text, output, voice, instruction, speakerModel, features, whisperModel, prompt;
     float speed = 1.0f;
     int port = 0, threads = 0, repeat = 1, chunkTokens = 0;
-    bool parentStdin = false, itn = true, verbose = false, tts = true, speaker = true;
+    bool parentStdin = false, itn = true, verbose = false, tts = true, speaker = true, whisper = true;
     std::vector<std::string> inputs;
 };
 
@@ -80,11 +82,13 @@ void usage()
                  "                          [--token T] [--threads N] [--parent-stdin] [--verbose]\n"
                  "                          [--tts-model COSYVOICE3.gguf --voices DIR | --no-tts]\n"
                  "                          [--speaker-model CAMPPLUS.onnx | --no-speaker]（声纹：每句话 final 带上说话人特征）\n"
-                 "  friday-voice transcribe (模型参数同上) [--language auto|zh|en|yue|ja|ko] [--no-itn] [--repeat N] AUDIO\n"
+                 "                          [--whisper-model GGML-WHISPER.bin | --no-whisper]（定稿用 Whisper：中英混说准）\n"
+                 "  friday-voice transcribe (模型参数同上) [--language auto|zh|en|yue|ja|ko] [--no-itn] [--prompt 热词] [--repeat N] AUDIO\n"
                  "  friday-voice speak      (--models DIR | --tts-model COSYVOICE3.gguf --voices DIR) --text TEXT --output OUT.wav\n"
                  "                          [--voice NAME] [--speed 1.0] [--instruction TEXT] [--repeat N]\n"
                  "  friday-voice speaker    (--models DIR | --speaker-model CAMPPLUS.onnx) AUDIO [AUDIO2 …]\n"
                  "                          打印每段的声纹（192 维），两段以上再打印两两的相似度；[--features F.bin] 用这份特征（测试用）\n"
+                 "  friday-voice merge      SENSEVOICE文字 WHISPER文字 [--language zh]（看两边的听写怎么合起来，调试用）\n"
                  "  friday-voice info       [--device …]\n"
                  "  friday-voice --version\n",
                  VOICE_VERSION);
@@ -150,6 +154,12 @@ bool parse(int argc, char** argv, Options& o)
             if (!next(o.speakerModel)) return false;
         } else if (a == "--no-speaker") {
             o.speaker = false;
+        } else if (a == "--whisper-model") {
+            if (!next(o.whisperModel)) return false;
+        } else if (a == "--no-whisper") {
+            o.whisper = false;
+        } else if (a == "--prompt") {
+            if (!next(o.prompt)) return false;
         } else if (a == "--features") {
             if (!next(o.features)) return false;
         } else if (a == "--parent-stdin") {
@@ -229,6 +239,22 @@ bool resolveModels(Options& o, std::string* error)
         }
         if (o.voices.empty() && fs::exists(dir / "voices"))
             o.voices = (dir / "voices").u8string();
+        // v0.3 Whisper：whisper/ 里优先 large-v3-turbo 的 q5_0，其次随便哪个 ggml-*.bin
+        if (o.whisperModel.empty()) {
+            const fs::path sub = dir / "whisper";
+            if (fs::exists(sub / "ggml-large-v3-turbo-q5_0.bin")) {
+                o.whisperModel = (sub / "ggml-large-v3-turbo-q5_0.bin").u8string();
+            } else {
+                std::error_code ec;
+                for (const auto& entry : fs::directory_iterator(sub, ec)) {
+                    const std::string name = entry.path().filename().u8string();
+                    if (name.rfind("ggml-", 0) == 0 && entry.path().extension() == ".bin") {
+                        o.whisperModel = entry.path().u8string();
+                        break;
+                    }
+                }
+            }
+        }
         // 声纹：CosyVoice 模型目录里的 campplus.onnx
         if (o.speakerModel.empty()) {
             for (const fs::path& candidate : { dir / "campplus.onnx", dir / "cosyvoice3" / "campplus.onnx" }) {
@@ -241,6 +267,8 @@ bool resolveModels(Options& o, std::string* error)
     }
     if (!o.speaker)
         o.speakerModel.clear();
+    if (!o.whisper)
+        o.whisperModel.clear();
     // 默认音色随包发，在可执行文件旁边的 voices/
     if (o.voices.empty()) {
         const fs::path beside = executableDir() / "voices";
@@ -460,6 +488,16 @@ int main(int argc, char** argv)
         return ok ? 0 : 1;
     }
 
+    // 调试：两边的听写怎么合起来（不加载模型）
+    if (o.command == "merge") {
+        if (o.inputs.size() < 2) {
+            usage();
+            return 2;
+        }
+        std::printf("%s\n", voice::Whisper::merge(o.inputs[0], o.inputs[1], o.language == "auto" ? "zh" : o.language).c_str());
+        std::fflush(stdout);
+        return 0;
+    }
     if (o.command != "serve" && o.command != "transcribe" && o.command != "speak" && o.command != "speaker") {
         usage();
         return 2;
@@ -490,6 +528,15 @@ int main(int argc, char** argv)
         VLOG_ERROR("%s", error.c_str());
         return 3;
     }
+    // v0.3 定稿用的 Whisper：加载不了就只用 SenseVoice
+    std::unique_ptr<voice::Whisper> whisper;
+    if (!o.whisperModel.empty()) {
+        whisper = std::make_unique<voice::Whisper>(backend);
+        if (!whisper->load(o.whisperModel, &error)) {
+            VLOG_WARN("Whisper 用不了，定稿只用 SenseVoice：%s", error.c_str());
+            whisper.reset();
+        }
+    }
 
     if (o.command == "transcribe") {
         if (o.input.empty()) {
@@ -506,11 +553,12 @@ int main(int argc, char** argv)
         config.language = o.language;
         config.itn = o.itn;
         config.endSilenceMs = 600;
+        config.prompt = o.prompt;
         std::string text, language;
         for (int i = 0; i < o.repeat; ++i) {
             const auto started = std::chrono::steady_clock::now();
             language.clear();
-            text = voice::transcribeWhole(recognizer, vad, fbank, pcm, config, &language, &error);
+            text = voice::transcribeWhole(recognizer, vad, fbank, pcm, config, &language, &error, whisper.get());
             const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             VLOG_INFO("第 %d 次：%.2f 秒音频，用时 %.3f 秒（实时率 %.4f）", i + 1, pcm.size() / double(voice::kSampleRate), seconds,
                       seconds / (pcm.size() / double(voice::kSampleRate)));
@@ -553,7 +601,7 @@ int main(int argc, char** argv)
     options.host = o.host;
     options.port = o.port;
     options.token = o.token;
-    voice::Server server(backend, recognizer, vad, synthesizer, options, voiceprint.get());
+    voice::Server server(backend, recognizer, vad, synthesizer, options, voiceprint.get(), whisper.get());
     if (!server.start(&error)) {
         VLOG_ERROR("%s", error.c_str());
         return 6;
@@ -563,6 +611,11 @@ int main(int argc, char** argv)
         std::vector<float> silence(voice::kSampleRate, 0.0f);
         const voice::Transcript warm = recognizer.transcribe(silence.data(), silence.size(), "auto", true);
         VLOG_INFO("预热完成：%.3f 秒", warm.seconds);
+    }
+    if (whisper) {
+        std::vector<float> silence(voice::kSampleRate, 0.0f);
+        const voice::Whisper::Result warm = whisper->transcribe(silence.data(), silence.size(), "zh", "");
+        VLOG_INFO("Whisper 预热完成：%.3f 秒", warm.seconds);
     }
     if (voiceprint) {
         std::vector<float> noise(voice::kSampleRate);

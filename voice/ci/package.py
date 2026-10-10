@@ -28,6 +28,7 @@ def licenses(build: Path, dest: Path):
         "ggml.txt": [deps / "ggml-src" / "LICENSE"],
         "cosyvoice.cpp.txt": [deps / "cosyvoice-src" / "LICENSE"],
         "civetweb.txt": [deps / "civetweb-src" / "LICENSE.md"],
+        "whisper.cpp.txt": [deps / "whisper-src" / "LICENSE"],
         "pcre2.txt": [deps / "pcre2-src" / "LICENCE.md", deps / "pcre2-src" / "LICENCE"],
         "FunASR.txt": [VOICE / "third_party" / "funasr" / "LICENSE"],
     }

@@ -1,12 +1,13 @@
 # friday-voice：本地 GPU 实时语音（Friday 的 Power）
 #
-# 一个可执行文件：ggml（CUDA / Vulkan / Metal / OpenCL / CPU 静态链进来）+ SenseVoice 识别 + FSMN-VAD + HTTP/WebSocket 服务。
+# 一个可执行文件：ggml（CUDA / Vulkan / Metal / OpenCL / CPU 静态链进来）+ SenseVoice 识别 + FSMN-VAD + HTTP/WebSocket 服务；
+# v0.3 起带 whisper.cpp（定稿用 Whisper，中英混说准）。
 # 模型不打进文件，运行时由 --model / --vad 指定（Friday 负责下载）。
 #
 #   cmake -B build -G Ninja -DVOICE_CUDA=ON          # 或 -DVOICE_VULKAN=ON，可同时开
 #   cmake --build build                               # 产物 build/bin/friday-voice
 cmake_minimum_required(VERSION 3.24)
-project(friday-voice VERSION 0.2.1 LANGUAGES C CXX)
+project(friday-voice VERSION 0.3.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -177,6 +178,25 @@ if(VOICE_TTS)
     endif()
 endif()
 
+# ── whisper.cpp v1.9.5：只编 src/whisper.cpp（它带的 ggml 也是 0.26.0，和上面同一份；不走它的 CMake，免得再编一份 ggml）──
+FetchContent_Declare(whisper
+    URL https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v1.9.5.tar.gz
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_GetProperties(whisper)
+if(NOT whisper_POPULATED)
+    FetchContent_Populate(whisper)
+endif()
+add_library(whisper_core STATIC ${whisper_SOURCE_DIR}/src/whisper.cpp ${whisper_SOURCE_DIR}/src/aneforge/whisper-aneforge.cpp)
+target_include_directories(whisper_core PUBLIC ${whisper_SOURCE_DIR}/include PRIVATE ${whisper_SOURCE_DIR}/src)
+target_compile_definitions(whisper_core PRIVATE WHISPER_VERSION="1.9.5")
+target_compile_features(whisper_core PRIVATE cxx_std_17)
+target_link_libraries(whisper_core PUBLIC ggml)
+if(MSVC)
+    target_compile_options(whisper_core PRIVATE /bigobj /W0)
+else()
+    target_compile_options(whisper_core PRIVATE -w)
+endif()
+
 # ── friday-voice ──
 add_executable(friday-voice
     src/main.cpp
@@ -188,6 +208,7 @@ add_executable(friday-voice
     src/AudioIO.cpp
     src/OnnxWeights.cpp
     src/SpeakerEncoder.cpp
+    src/WhisperRecognizer.cpp
     src/Server.cpp)
 target_include_directories(friday-voice PRIVATE src ${VOICE_HEADER_DIR})
 target_compile_definitions(friday-voice PRIVATE
@@ -196,7 +217,7 @@ target_compile_definitions(friday-voice PRIVATE
     $<$<BOOL:${VOICE_VULKAN}>:VOICE_HAS_VULKAN>
     $<$<BOOL:${VOICE_METAL}>:VOICE_HAS_METAL>
     $<$<BOOL:${VOICE_OPENCL}>:VOICE_HAS_OPENCL>)
-target_link_libraries(friday-voice PRIVATE ggml civetweb)
+target_link_libraries(friday-voice PRIVATE ggml civetweb whisper_core)
 if(VOICE_TTS)
     target_sources(friday-voice PRIVATE src/Synthesizer.cpp src/TextSplitter.cpp src/Speaker.cpp)
     target_compile_definitions(friday-voice PRIVATE VOICE_HAS_TTS)

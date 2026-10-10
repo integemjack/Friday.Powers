@@ -4,6 +4,7 @@
 
 #include "Log.h"
 #include "Streamer.h"
+#include "WhisperRecognizer.h"
 #ifdef VOICE_HAS_TTS
 #include "Speaker.h"
 #include "Synthesizer.h"
@@ -134,8 +135,9 @@ int logMessage(const mg_connection*, const char* message)
 } // namespace
 
 Server::Server(Backend& backend, SenseVoice& recognizer, FsmnVad& vad, Synthesizer* synthesizer, const ServerOptions& options,
-               SpeakerEncoder* voiceprint)
-    : m_backend(backend), m_recognizer(recognizer), m_vad(vad), m_synth(synthesizer), m_voiceprint(voiceprint), m_options(options)
+               SpeakerEncoder* voiceprint, Whisper* whisper)
+    : m_backend(backend), m_recognizer(recognizer), m_vad(vad), m_synth(synthesizer), m_voiceprint(voiceprint), m_whisper(whisper),
+      m_options(options)
 {
 }
 
@@ -236,6 +238,9 @@ int Server::handleInfo(mg_connection* conn)
         capabilities.push_back("speakerEmbedding");
         models["speaker"] = m_voiceprint->path();
     }
+    // v0.3 定稿用的 Whisper（中英混说）
+    if (m_whisper)
+        models["whisper"] = m_whisper->path();
 #ifdef VOICE_HAS_TTS
     if (m_synth) {
         capabilities.push_back("speech");
@@ -369,8 +374,13 @@ int Server::handleTranscriptions(mg_connection* conn)
     if (!SenseVoice::supportsLanguage(config.language))
         config.language = "auto";
     config.endSilenceMs = 600;
+    // v0.3 OpenAI 兼容的 prompt（热词、上文）交给 Whisper；带 whisper=false 时只用 SenseVoice
+    config.prompt = fields.count("prompt") ? fields["prompt"] : std::string();
+    config.whisper = !(fields.count("whisper") && fields["whisper"] == "false");
+    if (!config.prompt.empty())
+        VLOG_DEBUG("听录音的热词：%s", config.prompt.c_str());
     std::string language;
-    const std::string text = transcribeWhole(m_recognizer, m_vad, m_fbank, pcm, config, &language, &error);
+    const std::string text = transcribeWhole(m_recognizer, m_vad, m_fbank, pcm, config, &language, &error, m_whisper);
     if (!error.empty()) {
         replyError(conn, 500, error);
         return 500;
@@ -534,11 +544,12 @@ void Server::onSocketReady(mg_connection* conn)
     auto* session = new Session;
     session->io = io;
     session->streamer = std::make_shared<Streamer>(m_recognizer, m_vad, m_fbank, m_queue,
-                                                   [io](const std::string& text) { io->send(text); }, m_options.vadThreads, m_voiceprint);
+                                                   [io](const std::string& text) { io->send(text); }, m_options.vadThreads, m_voiceprint,
+                                                   m_whisper);
     mg_set_user_connection_data(conn, session);
     const DeviceInfo& d = m_backend.device();
     io->send(json { { "type", "ready" }, { "model", "sensevoice-small" }, { "device", d.backend + " " + d.description },
-                    { "sample_rate", kSampleRate }, { "speaker", m_voiceprint != nullptr } }
+                    { "sample_rate", kSampleRate }, { "speaker", m_voiceprint != nullptr }, { "whisper", m_whisper != nullptr } }
                  .dump());
     VLOG_INFO("实时听写连接");
 }
@@ -600,6 +611,8 @@ int Server::onSocketData(mg_connection* conn, int bits, char* data, size_t size)
         config.partials = message.value("partials", config.partials);
         config.itn = message.value("itn", config.itn);
         config.speaker = message.value("speaker", config.speaker) && m_voiceprint;
+        config.whisper = message.value("whisper", config.whisper);
+        config.prompt = message.value("prompt", config.prompt);
         session->streamer->configure(config);
     } else if (type == "flush") {
         session->streamer->flush();

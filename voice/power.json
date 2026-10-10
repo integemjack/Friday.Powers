@@ -2,7 +2,7 @@
   "schema": 1,
   "id": "voice",
   "title": "本地语音",
-  "detail": "用本机 GPU 实时听写（边说边出字幕，说完一句出带标点的定稿）和边写边读（大模型边出字边念，可打断）、声纹（只认登记过的人说的话）；不联网、不花钱。",
+  "detail": "用本机 GPU 实时听写（边说边出字幕，说完一句出带标点的定稿；中英混说的英文词用 Whisper 认）和边写边读（大模型边出字边念，可打断）、声纹（只认登记过的人说的话）；不联网、不花钱。",
   "executable": "friday-voice",
   "serve": [
     "serve",
@@ -43,6 +43,15 @@
       "license": "FunASR 模型许可（https://github.com/modelscope/FunASR/blob/main/MODEL_LICENSE）"
     },
     {
+      "id": "whisper-large-v3-turbo-q5",
+      "file": "whisper/ggml-large-v3-turbo-q5_0.bin",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
+      "sha256": "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
+      "size": 574041195,
+      "purpose": "听写定稿（Whisper large-v3-turbo，中英混说时认英文词）",
+      "license": "MIT（https://github.com/openai/whisper/blob/main/LICENSE）"
+    },
+    {
       "id": "cosyvoice3-q8",
       "file": "cosyvoice3/CosyVoice3-2512_Q8_0.gguf",
       "url": "https://modelscope.cn/models/Lourdle/Fun-CosyVoice3-0.5B-2512-GGUF/resolve/master/CosyVoice3-2512_Q8_0.gguf",
@@ -76,6 +85,7 @@
       "models": [
         "sensevoice-small-q8",
         "fsmn-vad",
+        "whisper-large-v3-turbo-q5",
         "cosyvoice3-q8",
         "campplus"
       ]
@@ -85,6 +95,7 @@
       "models": [
         "sensevoice-small-q8",
         "fsmn-vad",
+        "whisper-large-v3-turbo-q5",
         "cosyvoice3-q8",
         "campplus"
       ]
@@ -94,6 +105,7 @@
       "models": [
         "sensevoice-small-q8",
         "fsmn-vad",
+        "whisper-large-v3-turbo-q5",
         "cosyvoice3-q8",
         "campplus"
       ]
@@ -103,6 +115,7 @@
       "models": [
         "sensevoice-small-q8",
         "fsmn-vad",
+        "whisper-large-v3-turbo-q5",
         "cosyvoice3-q4km",
         "campplus"
       ]

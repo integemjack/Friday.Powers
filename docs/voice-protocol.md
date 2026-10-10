@@ -13,7 +13,8 @@
     —— 可选，在第一段音频之前发；`language` 取 `auto|zh|en|yue|ja|ko`；不发就用默认值。
     `sample_rate` 不是 16000 时服务端自己重采样。其他可选字段：`max_segment_ms`（默认 20000）、
     `vad_threshold`（默认 0.6）、`partials`（默认 true）、`itn`（标点和数字，默认 true）、
-    `speaker`（默认 false：true 时 final / partial 带这句的声纹，见下文「声纹」；`ready.speaker` 为 false 时没有声纹模型、这个字段不起作用）。
+    `speaker`（默认 false：true 时 final / partial 带这句的声纹，见下文「声纹」；`ready.speaker` 为 false 时没有声纹模型、这个字段不起作用）、
+    `whisper`（默认 true：装了 Whisper 时定稿用它，见下文「Whisper 定稿」）、`prompt`（交给 Whisper 的热词、上文，如「Secret Chat、Claude Code」）。
   - `{"type":"flush"}` —— 正在说的这句马上定稿（比如用户按了「说完了」）。
   - `{"type":"stop"}` —— 算完剩下的、正在说的定稿。
 
@@ -21,10 +22,10 @@
 
 | type | 字段 | 说明 |
 |---|---|---|
-| `ready` | `model`, `device`, `sample_rate`, `speaker` | 连上、模型就绪；`speaker`：有没有声纹模型 |
+| `ready` | `model`, `device`, `sample_rate`, `speaker`, `whisper` | 连上、模型就绪；`speaker`：有没有声纹模型；`whisper`：定稿用不用 Whisper（v0.3） |
 | `speech_start` | `segment`, `start_ms` | 检测到开口（打断助手用） |
 | `partial` | `segment`, `text`, `speaker`? | 这句目前听到的（实时字幕），只在变了时发 |
-| `final` | `segment`, `text`, `start_ms`, `end_ms`, `language`, `emotion`, `event`, `latency_ms`, `infer_ms`, `speaker`? | 一句说完：带标点的定稿；`latency_ms` = 判定说完到出结果 |
+| `final` | `segment`, `text`, `start_ms`, `end_ms`, `language`, `emotion`, `event`, `latency_ms`, `infer_ms`, `model`, `whisper_ms`?, `speaker`? | 一句说完：带标点的定稿；`latency_ms` = 判定说完到出结果；`model`：sensevoice / whisper（v0.3） |
 | `speech_end` | `segment` | 这句没听出字（噪音、咳嗽）时代替 final |
 | `error` | `message` | |
 
@@ -37,6 +38,23 @@
 - 说话中每 `partial_interval_ms` 对这句已有的录音整段重识别一次出 `partial`（SenseVoice 非自回归，5080 上一次约 40 毫秒）；
   刚开口那零点几秒模型常把气声猜成「Yeah.」之类，这种不发；
 - 说完那一刻对整句识别一次（带逆文本正则化：标点、数字）出 `final`。
+
+### Whisper 定稿（v0.3，用户 2026-10-10「识别不清楚我说的英语」）
+
+- 中文为主的一句里夹着英文词（「帮我看看 Secret Chat」），SenseVoice 按中文听，常把英文按读音写成汉字（「C亏欠」）。
+  装了 Whisper（`whisper/ggml-large-v3-turbo-q5_0.bin`，whisper.cpp v1.9.5，和这里同一份 ggml）时：
+  实时字幕、断句、判断是不是人声、认语种照旧用 SenseVoice；认定是人声的一句再交给 Whisper（语种用 SenseVoice 认出的，
+  中文先给一句「以下是普通话的句子，中间可能夹着英文。」让它出简体带标点，后面接 `prompt` 的热词）。
+- 两边合起来（`Whisper::merge`）：按字 / 英文词对齐（编辑距离），一样的地方中文和标点用 SenseVoice 的、英文词用 Whisper 的（大小写、拼写）；
+  不一样的一段——Whisper 那边是英文词、SenseVoice 那边是汉字（把英文写成了汉字）或两边都是英文 → 用 Whisper 的，
+  别的（中文对中文、繁简、数字写法）→ 用 SenseVoice 的（它中文更准）。整句是英文（`language` = en）时直接用 Whisper 的。
+- Whisper 出错、出空、像是幻觉（「字幕由…提供」「谢谢观看」这类，或比 SenseVoice 长出三倍多）时用 SenseVoice 的。
+- 编码窗口：Whisper 默认按 30 秒算，一句几秒的话 M1 上要 4 秒多。备两个状态、窗口各自固定：放得下的句子（约 7.7 秒以内）用 512 帧（约 10 秒）
+  的，放不下的用 30 秒的（同一个状态前后两次窗口长度不一样时，后面的句子越来越不准——热词不起作用、英文全小写，whisper.cpp v1.9.5 实测）。
+  不做温度回退（M1 上一句会拖到 8 秒多），一句最多出 每秒 15 个 + 24 个 token。
+- 用时：5080（CUDA）上一句 4–5 秒的话 Whisper 多花约 0.03–0.05 秒；M1（Metal，不开 flash attention）约 1 秒，10 秒的长句约 4 秒。
+  `friday-voice merge 文字A 文字B` 看两边怎么合。
+- 一次性听写（`/v1/audio/transcriptions`）同样处理，认 OpenAI 的 `prompt` 字段；带 `whisper=false` 时只用 SenseVoice（`model` 字段不看：Friday 一直传的是 sensevoice-small）。
 
 ### 声纹（v0.2，`start.speaker: true`）
 

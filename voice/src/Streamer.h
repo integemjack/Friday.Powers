@@ -3,6 +3,8 @@
 // 协议见 docs/voice-protocol.md。feed 在连接线程调，识别在推理线程跑，结果通过 send 回调发出去（send 要线程安全）。
 // 声纹（start 帧 speaker: true、加载了 campplus）：final 带这句的声纹（speaker，192 维单位向量）；说了 1 秒以上的 partial
 // 每多 0.8 秒也带一次（客户端判断插话的是不是登记过的人）。
+// v0.3 定稿（加载了 Whisper、start 帧没关 whisper）：SenseVoice 认定是人声的一句再交给 Whisper（中英混说准），
+// start 帧的 prompt（热词）交给它；final 带 model（whisper / sensevoice）、whisper_ms。
 #pragma once
 
 #include "AudioIO.h"
@@ -10,6 +12,7 @@
 #include "InferenceQueue.h"
 #include "SenseVoice.h"
 #include "SpeakerEncoder.h"
+#include "WhisperRecognizer.h"
 
 #include "json.hpp"
 
@@ -36,22 +39,28 @@ struct StreamConfig {
     bool partials = true;
     bool itn = true;
     bool speaker = false;   // final / partial 带上声纹
+    bool whisper = true;    // 有 Whisper 时定稿用它
+    std::string prompt;     // 交给 Whisper 的热词、上文（项目名之类）
 };
 
 /// 整段离线断句（一次性听写用，和实时同一套状态机）：每帧概率 → [开始帧, 结束帧) 列表
 std::vector<std::pair<int, int>> segmentFrames(const std::vector<float>& probability, const StreamConfig& config);
 
-/// 整段识别：VAD 断句后逐句识别，按语种接起来（中日韩不加空格）
+/// 整段识别：VAD 断句后逐句识别，按语种接起来（中日韩不加空格）；有 whisper 时每句的定稿用它（同实时）
 std::string transcribeWhole(SenseVoice& recognizer, const FsmnVad& vad, const Fbank& fbank, const std::vector<float>& pcm16k,
-                            const StreamConfig& config, std::string* language, std::string* error);
+                            const StreamConfig& config, std::string* language, std::string* error, Whisper* whisper = nullptr);
+
+/// 一句的定稿：有 Whisper（并且这次要用）就交给它，不像样就用 SenseVoice 的；model 是用了哪个
+std::string finalText(const Transcript& sensevoice, Whisper* whisper, const StreamConfig& config, const float* pcm, size_t count,
+                      std::string* model, double* whisperSeconds);
 
 class Streamer : public std::enable_shared_from_this<Streamer> {
 public:
     using Send = std::function<void(const std::string& json)>;
 
-    /// voiceprint 可以是空（没装声纹模型）
+    /// voiceprint、whisper 可以是空（没装声纹模型、Whisper 模型）
     Streamer(SenseVoice& recognizer, const FsmnVad& vad, const Fbank& fbank, InferenceQueue& queue, Send send, int vadThreads,
-             SpeakerEncoder* voiceprint = nullptr);
+             SpeakerEncoder* voiceprint = nullptr, Whisper* whisper = nullptr);
     ~Streamer();
 
     /// 收到 start 帧时调（只在第一段音频之前有效）
@@ -82,6 +91,7 @@ private:
 
     SenseVoice& m_recognizer;
     SpeakerEncoder* m_voiceprint;
+    Whisper* m_whisper;
     InferenceQueue& m_queue;
     Send m_send;
     StreamConfig m_config;

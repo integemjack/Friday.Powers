@@ -157,8 +157,28 @@ std::vector<std::pair<int, int>> segmentFrames(const std::vector<float>& probabi
     return segments;
 }
 
+std::string finalText(const Transcript& sensevoice, Whisper* whisper, const StreamConfig& config, const float* pcm, size_t count,
+                      std::string* model, double* whisperSeconds)
+{
+    if (model)
+        *model = "sensevoice";
+    if (!whisper || !config.whisper || sensevoice.text.empty())
+        return sensevoice.text;
+    const Whisper::Result w = whisper->transcribe(pcm, count, sensevoice.language, config.prompt);
+    if (whisperSeconds)
+        *whisperSeconds = w.seconds;
+    if (!w.ok || !Whisper::plausible(w.text, sensevoice.text)) {
+        VLOG_DEBUG("Whisper 的不用（%s）：%s；用 SenseVoice 的：%s", w.ok ? "不像样" : w.error.c_str(), w.text.c_str(), sensevoice.text.c_str());
+        return sensevoice.text;
+    }
+    if (model)
+        *model = "whisper";
+    // 中文用 SenseVoice 的、英文词用 Whisper 的（见 Whisper::merge）
+    return Whisper::merge(sensevoice.text, w.text, sensevoice.language);
+}
+
 std::string transcribeWhole(SenseVoice& recognizer, const FsmnVad& vad, const Fbank& fbank, const std::vector<float>& pcm,
-                            const StreamConfig& config, std::string* language, std::string* error)
+                            const StreamConfig& config, std::string* language, std::string* error, Whisper* whisper)
 {
     const auto started = std::chrono::steady_clock::now();
     VadStream stream(vad, fbank, 4);
@@ -185,17 +205,22 @@ std::string transcribeWhole(SenseVoice& recognizer, const FsmnVad& vad, const Fb
             continue;
         if (language && language->empty() && !t.language.empty() && t.language != "nospeech")
             *language = t.language;
-        if (!text.empty() && !isCjkLead(text, true) && !isCjkLead(t.text, false))
+        double whisperSeconds = 0;
+        const std::string sentence = finalText(t, whisper, config, pcm.data() + begin, end - begin, nullptr, &whisperSeconds);
+        if (whisperSeconds > 0)
+            VLOG_DEBUG("    Whisper %.3f 秒：%s", whisperSeconds, sentence.c_str());
+        if (!text.empty() && !isCjkLead(text, true) && !isCjkLead(sentence, false))
             text += ' ';
-        text += t.text;
+        text += sentence;
     }
     return text;
 }
 
 Streamer::Streamer(SenseVoice& recognizer, const FsmnVad& vad, const Fbank& fbank, InferenceQueue& queue, Send send, int vadThreads,
-                   SpeakerEncoder* voiceprint)
+                   SpeakerEncoder* voiceprint, Whisper* whisper)
     : m_recognizer(recognizer)
     , m_voiceprint(voiceprint)
+    , m_whisper(whisper)
     , m_queue(queue)
     , m_send(std::move(send))
     , m_vad(std::make_unique<VadStream>(vad, fbank, vadThreads))
@@ -318,16 +343,23 @@ void Streamer::endSegment(int endFrame, const char* reason)
             std::lock_guard<std::mutex> lock(self->m_mutex);
             self->m_finalizedThrough = std::max(self->m_finalizedThrough, segment);
         }
-        const int64_t latency = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - detected).count();
         if (!t.ok) {
             self->emit(json { { "type", "error" }, { "segment", segment }, { "message", t.error } }.dump());
         } else if (t.text.empty() || !worthFinal(t)) {
             VLOG_DEBUG("第 %d 句不算说话：%s [%s/%s]", segment, t.text.c_str(), t.emotion.c_str(), t.event.c_str());
             self->emit(json { { "type", "speech_end" }, { "segment", segment } }.dump());
         } else {
-            json final { { "type", "final" }, { "segment", segment }, { "text", t.text }, { "start_ms", startMs }, { "end_ms", endMs },
+            // v0.3 是人声：定稿交给 Whisper（中英混说准），不像样就用 SenseVoice 的
+            std::string model;
+            double whisperSeconds = 0;
+            const std::string text = finalText(t, self->m_whisper, self->m_config, samples.data(), samples.size(), &model, &whisperSeconds);
+            const int64_t latency = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - detected).count();
+            VLOG_DEBUG("第 %d 句定稿（%s，%lld 毫秒）：%s", segment, model.c_str(), static_cast<long long>(latency), text.c_str());
+            json final { { "type", "final" }, { "segment", segment }, { "text", text }, { "start_ms", startMs }, { "end_ms", endMs },
                          { "language", t.language }, { "emotion", t.emotion }, { "event", t.event },
-                         { "latency_ms", latency }, { "infer_ms", int64_t(t.seconds * 1000) } };
+                         { "latency_ms", latency }, { "infer_ms", int64_t(t.seconds * 1000) }, { "model", model } };
+            if (model == "whisper" || whisperSeconds > 0)
+                final["whisper_ms"] = int64_t(whisperSeconds * 1000);
             if (json speaker = self->voiceprintOf(samples); !speaker.is_null())
                 final["speaker"] = std::move(speaker);
             self->emit(final.dump());

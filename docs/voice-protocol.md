@@ -71,7 +71,7 @@
 
 | type | 字段 | 说明 |
 |---|---|---|
-| `start` | `voice`, `speed`, `sample_rate`, `instruction` | 可选；`voice` 见 `ready.voices`（空 = 默认），`speed` 0.5–2，`sample_rate` 是发回来的音频的采样率（默认模型的 24000），`instruction` 是 CosyVoice3 的指令（如「用四川话说」，空 = 普通朗读） |
+| `start` | `voice`, `speed`, `sample_rate`, `instruction` | 可选；`voice` 见 `ready.voices`（空 = 默认），`speed` 0.5–2，`sample_rate` 是发回来的音频的采样率（默认模型的 24000），`instruction` 是 CosyVoice3 的指令（如「用四川话说」，空 = 普通朗读）。可以随时再发一次换音色、语气：只管之后交过去的字，还没念完的照原样念（0.4 起；之前的版本连还没开始念的也换） |
 | `text` | `text` | 追加一段字（大模型新吐的 delta，可以是 Markdown） |
 | `flush` | | 这一轮说完了：剩下的字念完后回 `done` |
 | `say` | `text` | 等于 `text` + `flush` |

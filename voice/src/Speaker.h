@@ -49,6 +49,8 @@ private:
         int index = 0;
         std::string text;
         bool endOfTurn = false;
+        /// 进队列时的音色、语气（0.4：之后再 start 换语气只管后来的字，还没念完的上一轮照原样念）
+        SpeakConfig config;
     };
 
     void enqueue(const std::vector<std::string>& segments, bool endOfTurn);

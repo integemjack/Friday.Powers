@@ -66,9 +66,9 @@ void Speaker::enqueue(const std::vector<std::string>& segments, bool endOfTurn)
         std::lock_guard<std::mutex> lock(m_mutex);
         const uint64_t turn = m_turn.load();
         for (const std::string& s : segments)
-            m_jobs.push_back({ turn, m_nextIndex++, s, false });
+            m_jobs.push_back({ turn, m_nextIndex++, s, false, m_config });
         if (endOfTurn)
-            m_jobs.push_back({ turn, -1, {}, true });
+            m_jobs.push_back({ turn, -1, {}, true, m_config });
     }
     m_wake.notify_one();
 }
@@ -104,7 +104,6 @@ void Speaker::run()
 {
     while (true) {
         Job job;
-        SpeakConfig config;
         {
             std::unique_lock<std::mutex> lock(m_mutex);
             m_wake.wait(lock, [this] { return m_closed || !m_jobs.empty(); });
@@ -112,14 +111,13 @@ void Speaker::run()
                 return;
             job = std::move(m_jobs.front());
             m_jobs.pop_front();
-            config = m_config;
         }
         if (!current(job.turn))
             continue;
         if (job.endOfTurn)
             m_sendText(json { { "type", "done" } }.dump());
         else
-            speakOne(job, config);
+            speakOne(job, job.config);
     }
 }
 

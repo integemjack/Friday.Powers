@@ -29,7 +29,18 @@
 | Fun-CosyVoice3-0.5B-2512（Lourdle 转的 GGUF） | Apache-2.0 |
 | Whisper large-v3-turbo（OpenAI；whisper.cpp 转的 ggml，q5_0） | [MIT](https://github.com/openai/whisper/blob/main/LICENSE) |
 
-## 默认音色
+## 音色
 
-`voices/default.gguf` 是用 cosyvoice.cpp 的前端，从 [CosyVoice](https://github.com/FunAudioLLM/CosyVoice)（Apache-2.0）
-仓库的 `asset/zero_shot_prompt.wav`（文字「希望你以后能够做的比我还好呦。」）提取的 prompt speech。
+`voices/*.gguf` 都是用 cosyvoice.cpp 的前端（`cosyvoice-cli --frontend-only`，CosyVoice3 的 speech_tokenizer_v3.onnx + campplus.onnx）
+从下面的录音提取的 prompt speech（只含语音 token、声学特征和说话人向量，不含录音本身）：
+
+| 文件 | 音色 | 录音来源 | 许可 |
+|---|---|---|---|
+| `default.gguf` | 默认女声 | [CosyVoice](https://github.com/FunAudioLLM/CosyVoice) 仓库的 `asset/zero_shot_prompt.wav`（「希望你以后能够做的比我还好呦。」） | Apache-2.0 |
+| `young-male.gguf` | 青年男声 | [AISHELL-3](https://www.openslr.org/93/) 说话人 SSB0073 的 `SSB00730025`、`SSB00730028` 两句 | Apache-2.0 |
+| `calm-male.gguf` | 沉稳男声 | AISHELL-3 说话人 SSB0434 的 `SSB04340029`、`SSB04340066` 两句 | Apache-2.0 |
+| `gentle-female.gguf` | 温柔女声 | AISHELL-3 说话人 SSB0005 的 `SSB00050027` | Apache-2.0 |
+| `lively-female.gguf` | 活泼女声 | AISHELL-3 说话人 SSB0267 的 `SSB02670001` | Apache-2.0 |
+
+AISHELL-3：Shi, Yao, et al. "AISHELL-3: A Multi-speaker Mandarin TTS Corpus and the Baselines." arXiv:2010.11567（北京希尔贝壳科技，
+[Hugging Face 上的官方发布](https://huggingface.co/datasets/AISHELL/AISHELL-3)，Apache-2.0）。

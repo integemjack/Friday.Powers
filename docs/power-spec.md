@@ -73,7 +73,7 @@ schema 2 的清单多两个字段：`library`（`{format: "gguf", kinds: ["text"
 | `chat` | `POST /v1/chat/completions`（OpenAI 兼容 + `x_friday`） | 本地大模型（llm），多并发 + 基数树前缀共享，见 `llm-protocol.md` |
 | `imageGeneration` / `videoGeneration` | `POST /v1/jobs`、`POST /v1/images/generations` | 本地生图 / 生视频（diffusion），见 `diffusion-protocol.md` |
 
-吃显存的 Power（llm、diffusion）另有 `POST /v1/memory/release`：卸载模型、腾显存（Friday 生视频前让 llm 腾地方）。
+吃显存的 Power（llm、diffusion）另有 `POST /v1/memory/release`：卸载模型、腾显存。llm 还有 `POST /v1/memory/reserve`：给别的程序留显存（Friday 生图 / 生视频前让 llm 留出地方，见 [llm-protocol.md](llm-protocol.md) §1.1）。
 
 `speech` / `realtimeSpeech` 只在装了合成模型（CosyVoice3 + 至少一个音色）时出现在 `/v1/info` 的 `capabilities` 里。`speakerEmbedding`（声纹，v0.2）只在装了 `campplus.onnx` 时出现。
 

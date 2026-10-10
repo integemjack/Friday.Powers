@@ -6,6 +6,7 @@
 
 #include "Runtime.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -51,6 +52,11 @@ public:
     std::shared_ptr<flr::Runtime> acquire(const ModelChoice& choice, int* code, std::string* error);
     /// 卸载（腾显存）：等在途请求结束。返回卸载前加载的模型 id（没有为空）
     std::string unload();
+    /// 给别的程序（friday-diffusion 生图 / 生视频）留显存：之后加载模型时每张卡至少空出 mib MiB（llama.cpp 的 --fit-target，
+    /// 放不下就少放几层到显卡、上下文小一些），seconds 秒后失效（宿主不续就自动恢复）。现在加载着的模型留得不够就卸掉（等在途请求结束），
+    /// 下个请求按新的预留加载；预留到期或调小后，下个请求来时如果没有别的请求在算，按新的预留重新加载、把显存要回来。
+    /// mib = 0 取消。返回 {reserved_mib, seconds, unloaded}
+    json reserve(int mib, int seconds);
 
     /// /v1/info 的 model 部分（没加载为 null）
     json info() const;
@@ -60,6 +66,8 @@ public:
 
 private:
     bool same(const flr::Runtime& runtime, const ModelChoice& choice) const;
+    /// 现在有效的预留（MiB，到期为 0）。持锁调
+    int activeReserve() const;
 
     HostOptions m_options;
     mutable std::mutex m_mutex;
@@ -68,6 +76,10 @@ private:
     bool m_loading = false;
     std::string m_loadingId;
     std::string m_lastError;
+    /// 显存预留（reserve）与它的到期时间；m_loadedReserve 是现在这个模型加载时按的预留
+    int m_reserveMiB = 0;
+    std::chrono::steady_clock::time_point m_reserveUntil;
+    int m_loadedReserve = 0;
 };
 
 /// 一个 GGUF 文件名是不是视觉投影（mmproj）

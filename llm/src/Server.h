@@ -43,6 +43,7 @@ public:
     int handleChat(mg_connection* conn);
     int handleLoad(mg_connection* conn);
     int handleRelease(mg_connection* conn);
+    int handleReserve(mg_connection* conn);
     bool authorized(const mg_connection* conn) const;
 
 private:

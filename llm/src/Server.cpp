@@ -202,6 +202,7 @@ int modelsHandler(mg_connection* conn, void* data) { return static_cast<Server*>
 int chatHandler(mg_connection* conn, void* data) { return static_cast<Server*>(data)->handleChat(conn); }
 int loadHandler(mg_connection* conn, void* data) { return static_cast<Server*>(data)->handleLoad(conn); }
 int releaseHandler(mg_connection* conn, void* data) { return static_cast<Server*>(data)->handleRelease(conn); }
+int reserveHandler(mg_connection* conn, void* data) { return static_cast<Server*>(data)->handleReserve(conn); }
 
 int logMessage(const mg_connection*, const char* message)
 {
@@ -283,6 +284,7 @@ bool Server::start(std::string* error)
     mg_set_request_handler(m_ctx, "/v1/models/load", loadHandler, this);
     mg_set_request_handler(m_ctx, "/v1/chat/completions", chatHandler, this);
     mg_set_request_handler(m_ctx, "/v1/memory/release", releaseHandler, this);
+    mg_set_request_handler(m_ctx, "/v1/memory/reserve", reserveHandler, this);
     return true;
 }
 
@@ -382,6 +384,25 @@ int Server::handleRelease(mg_connection* conn)
     readBody(conn, ignored, nullptr);
     const std::string id = m_host.unload();
     replyJson(conn, 200, json { { "unloaded", id.empty() ? json(nullptr) : json(id) } });
+    return 200;
+}
+
+int Server::handleReserve(mg_connection* conn)
+{
+    if (!authorized(conn)) {
+        replyError(conn, 401, "unauthorized");
+        return 401;
+    }
+    std::string text;
+    readBody(conn, text, nullptr);
+    const json body = json::parse(text, nullptr, false);
+    if (!body.is_object() || !body.contains("mib") || !body["mib"].is_number()) {
+        replyError(conn, 400, "要 {\"mib\": 预留多少 MiB, \"seconds\": 多久}");
+        return 400;
+    }
+    const int mib = body["mib"].get<int>();
+    const int seconds = body.contains("seconds") && body["seconds"].is_number() ? body["seconds"].get<int>() : 900;
+    replyJson(conn, 200, m_host.reserve(mib, seconds));
     return 200;
 }
 

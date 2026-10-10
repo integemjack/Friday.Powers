@@ -18,11 +18,25 @@ friday-llm serve --models <模型库目录> [--models <另一个目录>]… --ho
 | 接口 | 说明 |
 |---|---|
 | `GET /health` | `{"status":"ok"}`；模型按请求加载，不等模型 |
-| `GET /v1/info` | `{id, version, "llama.cpp", capabilities, devices[{name,description,type,total,free}], model{loaded, loading, last_error}, in_flight}`；`model.loaded` 有调度统计 `cache`（见 §3） |
+| `GET /v1/info` | `{id, version, "llama.cpp", capabilities, devices[{name,description,type,total,free}], model{loaded, loading, last_error, reserved_mib, loaded_reserve_mib}, in_flight}`；`model.loaded` 有调度统计 `cache`（见 §3） |
 | `GET /v1/models` | 模型库目录里的 GGUF：`{data:[{id:"组织/仓库:量化档", path, size, vision, loaded}]}` |
 | `POST /v1/chat/completions` | OpenAI 兼容（流式 SSE / 不流式），工具调用、思考（`reasoning_content`）、看图（`image_url` 的 data URL），字段与 llama-server 的 `/v1/chat/completions` 一样 |
 | `POST /v1/models/load` | 先把模型加载好（用户在 Friday 里选了它时预热）：`{model, x_friday}` → `{model: <loaded 的信息>}` |
-| `POST /v1/memory/release` | 卸载模型、腾显存（Friday 生视频前调）：→ `{unloaded: <模型 id 或 null>}` |
+| `POST /v1/memory/release` | 卸载模型、腾显存：→ `{unloaded: <模型 id 或 null>}` |
+| `POST /v1/memory/reserve` | 给别的程序留显存（Friday 生图 / 生视频前调，见 §1.1）：`{mib, seconds}` → `{reserved_mib, seconds, unloaded}`；`mib: 0` 取消 |
+
+### 1.1 显存预留
+
+本地大模型和 friday-diffusion 共用一张显卡。大模型按 llama.cpp 的 fit 加载：上下文开到模型的训练长度、按空闲显存往下调，
+几乎会占满显卡，生图 / 生视频就只剩自己的权重挪到内存里、计算空间都拿不到（Wan2.2 直接失败）。光卸载也不行：
+智能体紧接着的下一个请求又会把模型按满显存加载回来。所以 Friday 在提交生图 / 生视频任务前调 `reserve`：
+
+- 之后加载模型时每张卡至少空出 `mib` MiB（`--fit-target`，放不下就少放几层到显卡、上下文小一些），最多留到整张卡的九成；
+- 现在加载着的模型留得不够就卸掉（等在途请求结束），下个请求按新的预留加载；
+- `seconds`（缺省 900）后失效；到期或调小后，下个请求来时没有别的请求在算就重新加载，把显存要回来。
+
+Friday 的预留 = 生图 / 生视频模型文件的大小（主模型 + VAE + 文本编码器）+ 计算空间（生图 1.5 GB、生视频 5 GB），
+15 分钟（friday-diffusion 闲置 10 分钟才放模型），生视频轮询时续、做完就取消（同时让 friday-diffusion 放掉视频模型）。
 
 ## 2. 请求里的 `model` 与 `x_friday`
 

@@ -3,6 +3,8 @@
 
 #include "RuntimeLog.h"
 
+#include "ggml-backend.h"
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -139,6 +141,29 @@ std::string projectorNear(const fs::path& model)
     return utf8(found.front());
 }
 
+/// 最小的那张显卡的显存（MiB；没有显卡为 0）
+int smallestGpuMiB()
+{
+    size_t smallest = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t device = ggml_backend_dev_get(i);
+        const auto type = ggml_backend_dev_type(device);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU)
+            continue;
+        size_t free = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(device, &free, &total);
+        if (total > 0 && (smallest == 0 || total < smallest))
+            smallest = total;
+    }
+    return int(smallest / 1048576);
+}
+
+/// llama.cpp 的 fit 缺省就给每张卡留 1 GiB；预留比这个小时不用另给
+constexpr int kDefaultFitTargetMiB = 1024;
+/// 预留到期 / 调小多少以上才值得重新加载
+constexpr int kRegrowMiB = 512;
+
 } // namespace
 
 bool isProjector(const std::string& fileName)
@@ -238,11 +263,21 @@ bool ModelHost::same(const flr::Runtime& runtime, const ModelChoice& choice) con
     return samePath && sameProjector;
 }
 
+int ModelHost::activeReserve() const
+{
+    if (m_reserveMiB <= 0 || std::chrono::steady_clock::now() >= m_reserveUntil)
+        return 0;
+    return m_reserveMiB;
+}
+
 std::shared_ptr<flr::Runtime> ModelHost::acquire(const ModelChoice& choice, int* code, std::string* error)
 {
     std::unique_lock<std::mutex> lock(m_mutex);
     while (true) {
-        if (m_current && !m_loading && same(*m_current, choice))
+        // 加载时为别的程序留了显存、现在预留到期或调小了：没有别的请求在算时重新加载，把显存要回来
+        const int reserve = activeReserve();
+        const bool regrow = m_current && m_loadedReserve > std::max(reserve, kDefaultFitTargetMiB) + kRegrowMiB && !m_current->busy();
+        if (m_current && !m_loading && same(*m_current, choice) && !regrow)
             return m_current;
         if (m_loading) {
             m_changed.wait(lock);
@@ -255,10 +290,14 @@ std::shared_ptr<flr::Runtime> ModelHost::acquire(const ModelChoice& choice, int*
         }
         m_loading = true;
         m_loadingId = choice.id;
+        const int previousReserve = m_loadedReserve;
         std::shared_ptr<flr::Runtime> old = std::move(m_current);
         lock.unlock();
         if (old) {
-            flr::logf(FLR_LOG_NOTICE, "换模型：%s → %s", old->modelId().c_str(), choice.id.c_str());
+            if (regrow && same(*old, choice))
+                flr::logf(FLR_LOG_NOTICE, "显存预留已解除（%d → %d MiB）：重新加载 %s", previousReserve, reserve, choice.id.c_str());
+            else
+                flr::logf(FLR_LOG_NOTICE, "换模型：%s → %s", old->modelId().c_str(), choice.id.c_str());
             old->shutdown();
             old.reset();
         }
@@ -271,11 +310,18 @@ std::shared_ptr<flr::Runtime> ModelHost::acquire(const ModelChoice& choice, int*
         options.contextTokens = m_options.contextTokens;
         options.perSequence = m_options.perSequence;
         options.extraArgs = m_options.extraArgs;
+        // 显存预留：放在追加参数后面，覆盖 FRIDAY_LLAMA_ARGS 里的 --fit-target
+        if (reserve > kDefaultFitTargetMiB) {
+            options.extraArgs.push_back("--fit-target");
+            options.extraArgs.push_back(std::to_string(reserve));
+            flr::logf(FLR_LOG_NOTICE, "给别的程序留 %d MiB 显存（生图 / 生视频）", reserve);
+        }
         flr::LoadError loadError;
         std::unique_ptr<flr::Runtime> loaded = flr::Runtime::load(options, nullptr, nullptr, loadError);
         lock.lock();
         m_loading = false;
         m_loadingId.clear();
+        m_loadedReserve = loaded ? reserve : 0;
         m_current = std::shared_ptr<flr::Runtime>(std::move(loaded));
         m_lastError = m_current ? std::string() : loadError.message;
         m_changed.notify_all();
@@ -306,12 +352,44 @@ std::string ModelHost::unload()
     return id;
 }
 
+json ModelHost::reserve(int mib, int seconds)
+{
+    mib = std::max(0, mib);
+    seconds = std::clamp(seconds, 1, 24 * 3600);
+    // 至少给大模型自己留一成：留得比整张卡还多时 fit 会把整个模型挪到内存里
+    if (const int total = smallestGpuMiB(); total > 0)
+        mib = std::min(mib, total * 9 / 10);
+    bool unloadNow = false;
+    int before = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        before = activeReserve();
+        m_reserveMiB = mib;
+        m_reserveUntil = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+        // 现在的模型留得不够：卸掉，下个请求按新的预留加载
+        unloadNow = m_current && mib > std::max(m_loadedReserve, kDefaultFitTargetMiB) + kRegrowMiB / 2;
+    }
+    // 生视频时宿主每次轮询都续一下：只在变了时记
+    if (mib != before)
+        flr::logf(FLR_LOG_NOTICE, mib > 0 ? "显存预留 %d MiB，%d 秒" : "显存预留取消", mib, seconds);
+    std::string unloaded;
+    if (unloadNow)
+        unloaded = unload();
+    return json {
+        { "reserved_mib", mib },
+        { "seconds", mib > 0 ? seconds : 0 },
+        { "unloaded", unloaded.empty() ? json(nullptr) : json(unloaded) },
+    };
+}
+
 json ModelHost::info() const
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     json result {
         { "loaded", m_current ? m_current->info() : json(nullptr) },
         { "loading", m_loading ? json(m_loadingId) : json(nullptr) },
+        { "reserved_mib", activeReserve() },
+        { "loaded_reserve_mib", m_current ? m_loadedReserve : 0 },
     };
     if (!m_lastError.empty())
         result["last_error"] = m_lastError;

@@ -160,7 +160,8 @@ void sdLog(enum sd_log_level_t level, const char* text, void*)
     switch (level) {
     case SD_LOG_ERROR: DLOG_ERROR("sd: %s", line.c_str()); break;
     case SD_LOG_WARN: DLOG_WARN("sd: %s", line.c_str()); break;
-    case SD_LOG_INFO: DLOG_INFO("sd: %s", line.c_str()); break;
+    // stable-diffusion.cpp 的 info 很碎（每一步加载、建图都打一行，宿主会把它们都记进日志）：--verbose 才打；
+    // 加载用时、任务完成这些我们自己记
     default: DLOG_DEBUG("sd: %s", line.c_str()); break;
     }
 }

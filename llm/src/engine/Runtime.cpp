@@ -417,7 +417,10 @@ std::unique_ptr<Runtime> Runtime::load(const LoadOptions& options, flr_progress_
     sequences = std::min(sequences, 255);
 
     // MARK: 参数（== llama-server 的命令行；-np 是序列数，内部工作序列下面再加）
-    std::vector<std::string> args { "-m", options.modelPath, "-np", std::to_string(sequences), "-kvu", "--jinja" };
+    // fit 显存不够时先把上下文往下压，最低压到 --fit-ctx（llama.cpp 缺省 4096），还不够才把层挪到内存里。
+    // Friday 的系统提示加工具定义就有一万多 token，4096 的池子什么请求都装不下：宁可少放几层到显卡，也保住 32K
+    // （为生图 / 生视频留显存时就会压到这里；模型的训练上下文本来就更小时 fit 不改它）。FRIDAY_LLAMA_ARGS 可以覆盖
+    std::vector<std::string> args { "-m", options.modelPath, "-np", std::to_string(sequences), "-kvu", "--jinja", "--fit-ctx", "32768" };
     if (!options.mmprojPath.empty()) {
         args.push_back("--mmproj");
         args.push_back(options.mmprojPath);

@@ -460,18 +460,34 @@ struct Scheduler::Impl {
 
         const RadixTree::Match match = tree.match(items);
         const size_t matched = std::min(match.length, limit);
+        // 现在就能分叉拿到的：PART 型就是树上匹配到的长度；不可回退的模型只能从检查点分叉，是匹配范围内最近的检查点。
+        // 等不等（③）按它算收益：只按树上匹配的长度算的话，混合模型上对方预填到离分叉点不到 dedupeMin 时就不等了，
+        // 可那时分叉点的检查点还没取，分叉不了，只能整段重算（实测三个子 Agent 同时派出，8.8K 的公共前缀一点没共用上）
+        size_t available = matched;
+        if (!part) {
+            available = 0;
+            for (const int holder : match.holders) {
+                if (holder >= config.nSeq)
+                    continue;
+                if (const Checkpoint* checkpoint = restorableAtOrBefore(caches[size_t(holder)], matched))
+                    available = std::max(available, size_t(checkpoint->n_items));
+            }
+        }
 
-        // ③ 正在预填的请求里有和它共用得更多的：等那个请求算过分叉点
+        // ③ 正在预填的请求里有和它共用得更多的：等那个请求算过分叉点（不可回退的模型：等它在分叉点取好检查点）
         for (const std::shared_ptr<Request>& other : active) {
             if (other->phase != Request::Phase::Prefill || other->seq < 0)
                 continue;
             const size_t shared = std::min(commonPrefix(other->chat.prepared.items, items), limit);
-            if (shared < matched + size_t(config.dedupeMin))
+            if (shared < available + size_t(config.dedupeMin))
                 continue;
             const size_t point = plannedForkPoint(*other, shared);
-            if (point < matched + size_t(config.dedupeMin))
+            if (point < available + size_t(config.dedupeMin))
                 continue;
-            if (caches[size_t(other->seq)].ledger().size() < point) {
+            const SequenceCache& cache = caches[size_t(other->seq)];
+            const Checkpoint* checkpoint = part ? nullptr : restorableAtOrBefore(cache, point);
+            const bool reached = part ? cache.ledger().size() >= point : checkpoint && size_t(checkpoint->n_items) >= point;
+            if (!reached) {
                 placement.wait = true;
                 return placement;
             }

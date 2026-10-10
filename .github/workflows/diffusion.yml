@@ -1,0 +1,212 @@
+# friday-diffusion：各平台编译、打包；推 diffusion-vX.Y.Z 标签时发 Release 并更新 index Release 里的索引（Friday 2.7 起读 index-v2.json）。
+name: diffusion
+
+on:
+  push:
+    branches: [main]
+    tags: ['diffusion-v*']
+    paths: ['diffusion/**', 'ci/**', '.github/workflows/diffusion.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: diffusion-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-x64-vulkan
+            backend: vulkan
+            runner: windows-2025
+          # CUDA 13.0 只认 VS 2019–2022，windows-2025 上的 VS 太新
+          - target: windows-x64-cuda
+            backend: cuda
+            runner: windows-2022
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x64
+      - uses: seanmiddleditch/gha-setup-ninja@v6
+      - name: 装 Vulkan SDK
+        if: matrix.backend == 'vulkan'
+        uses: jakoch/install-vulkan-sdk-action@v1.6.0
+        with:
+          install_runtime: false
+          cache: true
+          stripdown: true
+      - name: 装 CUDA 13.0
+        if: matrix.backend == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '13.0.0'
+          method: local
+          log-file-suffix: '${{ matrix.target }}.txt'
+      - name: 编译
+        shell: pwsh
+        run: |
+          $cmakeArgs = @('-S', 'diffusion', '-B', 'build', '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
+                    '-DGGML_NATIVE=OFF', '-DGGML_AVX2=ON', '-DGGML_FMA=ON', '-DGGML_F16C=ON')
+          if ('${{ matrix.backend }}' -eq 'vulkan') { $cmakeArgs += '-DDIFFUSION_VULKAN=ON' }
+          if ('${{ matrix.backend }}' -eq 'cuda') {
+            $cmakeArgs += @('-DDIFFUSION_CUDA=ON', '-DCMAKE_CUDA_ARCHITECTURES=75-virtual;86-real;89-real;120a-real')
+          }
+          cmake @cmakeArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # CUDA 13 的 cuBLAS DLL 在 bin\x64（不在 PATH 上，exe 起不来）
+          if ('${{ matrix.backend }}' -eq 'cuda') { $env:PATH = "$env:CUDA_PATH\bin\x64;$env:CUDA_PATH\bin;$env:PATH" }
+          .\build\bin\friday-diffusion.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: 打包
+        shell: pwsh
+        run: |
+          $extra = @()
+          if ('${{ matrix.backend }}' -eq 'cuda') {
+            $extra = Get-ChildItem -Recurse "$env:CUDA_PATH\bin" -Include 'cublas64_*.dll', 'cublasLt64_*.dll' | ForEach-Object FullName
+            if ($extra.Count -lt 2) { throw "没找到 cuBLAS 的 DLL" }
+          }
+          python ci/package.py --power diffusion --target ${{ matrix.target }} --build build --out dist --extra @extra
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    name: macos-arm64-metal
+    runs-on: macos-15
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v7
+      - name: 编译
+        run: |
+          brew list ninja >/dev/null 2>&1 || brew install ninja
+          cmake -S diffusion -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDIFFUSION_METAL=ON -DGGML_NATIVE=OFF \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0
+          cmake --build build
+          ./build/bin/friday-diffusion --version
+          otool -L build/bin/friday-diffusion
+      - name: 打包
+        run: python3 ci/package.py --power diffusion --target macos-arm64-metal --build build --out dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-arm64-metal
+          path: dist/*
+          if-no-files-found: error
+
+  # x64 Linux：直接在 ubuntu-22.04 运行器上编（glibc 2.35，和 Friday 的 Linux x64 包同一个系统）
+  linux-x64:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64-vulkan
+            backend: vulkan
+          - target: linux-x64-cuda
+            backend: cuda
+    steps:
+      - uses: actions/checkout@v7
+      - name: 装 GCC 13、Ninja
+        run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++-13 ninja-build
+      - name: 装 Vulkan SDK
+        if: matrix.backend == 'vulkan'
+        uses: jakoch/install-vulkan-sdk-action@v1.6.0
+        with:
+          install_runtime: false
+          cache: true
+          stripdown: true
+      - name: 装 CUDA 13.0
+        if: matrix.backend == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '13.0.0'
+          method: network
+          sub-packages: '["nvcc", "cudart", "cudart-dev", "cccl", "nvprune"]'
+          non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
+          log-file-suffix: '${{ matrix.target }}.txt'
+      - name: 编译
+        run: bash ci/build-linux.sh diffusion ${{ matrix.target }} build
+      - name: 打包
+        run: python3 ci/package.py --power diffusion --target ${{ matrix.target }} --build build --out dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  linux-arm64:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-arm64-jetson-orin
+            image: nvcr.io/nvidia/l4t-cuda:12.2.12-devel
+            setup: >-
+              apt-get update && apt-get install -y --no-install-recommends build-essential ninja-build python3 python3-pip ca-certificates binutils
+              software-properties-common gpg-agent && add-apt-repository -y ppa:ubuntu-toolchain-r/test && apt-get update &&
+              apt-get install -y --no-install-recommends g++-13 && pip3 install --no-cache-dir 'cmake>=3.28'
+          - target: linux-arm64-vulkan
+            image: ubuntu:24.04
+            setup: >-
+              apt-get update && apt-get install -y --no-install-recommends build-essential ninja-build cmake python3 ca-certificates binutils
+              libvulkan-dev glslc spirv-headers
+    steps:
+      - uses: actions/checkout@v7
+      - name: 编译
+        run: |
+          docker run --rm -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 -v "$PWD:/src" -w /src ${{ matrix.image }} bash -c \
+            "set -e; ${{ matrix.setup }}; bash ci/build-linux.sh diffusion ${{ matrix.target }} build"
+      - name: 打包
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" build
+          python3 ci/package.py --power diffusion --target ${{ matrix.target }} --build build --out dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/diffusion-v')
+    needs: [windows, macos, linux-x64, linux-arm64]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: 发布
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/diffusion-*.zip dist/diffusion-*.tar.gz --title "$TAG" \
+            --notes "friday-diffusion ${TAG#diffusion-v}：本地生图 / 生视频（stable-diffusion.cpp）。各平台包见附件，Friday 2.7 起通过 index 里的 index-v2.json 按需下载。" \
+            || gh release upload "$TAG" dist/diffusion-*.zip dist/diffusion-*.tar.gz --clobber
+          gh release view index >/dev/null 2>&1 || gh release create index --title "index" --notes "Friday 读的 Power 索引（index-v2.json、index.json），每次发 Power 时更新。" --latest=false
+          mkdir -p previous
+          gh release download index -p index.json -D previous || true
+          gh release download index -p index-v2.json -D previous || true
+          python3 ci/make_index.py --power diffusion --dist dist --tag "$TAG" --repo "$GITHUB_REPOSITORY" --previous previous --out out
+          gh release upload index out/index.json out/index-v2.json --clobber

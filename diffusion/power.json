@@ -1,0 +1,222 @@
+{
+  "schema": 2,
+  "id": "diffusion",
+  "title": "本地生图 / 生视频",
+  "detail": "用本机 GPU 生图、改图、生视频（stable-diffusion.cpp）：Z-Image、FLUX.2、Qwen-Image、Wan2.2 等，在模型库里选、按需下载（模型和它要的 VAE、文本编码器一起下）；不联网、不花钱。",
+  "executable": "friday-diffusion",
+  "serve": [
+    "serve",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "0",
+    "--token",
+    "{token}",
+    "--parent-stdin"
+  ],
+  "capabilities": [
+    "imageGeneration",
+    "videoGeneration"
+  ],
+  "library": {
+    "format": "gguf",
+    "kinds": [
+      "image",
+      "video"
+    ]
+  },
+  "families": [
+    {
+      "id": "z-image-turbo",
+      "title": "Z-Image-Turbo",
+      "kind": "image",
+      "detail": "通义 6B 文生图，8 步出图，中英文字写得好；4 GB 显存也能跑",
+      "match": [
+        "z[-_ ]?image[-_ ]?turbo"
+      ],
+      "main": "diffusion_model",
+      "recommended": {
+        "repo": "leejet/Z-Image-Turbo-GGUF",
+        "file": "z_image_turbo-Q4_K.gguf",
+        "size": 3864250304,
+        "sha256": "14b375ab4f226bc5378f68f37e899ef3c2242b8541e61e2bc1aff40976086fbd"
+      },
+      "components": {
+        "vae": {
+          "repo": "Comfy-Org/z_image_turbo",
+          "file": "split_files/vae/ae.safetensors",
+          "size": 335304388,
+          "sha256": "afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38"
+        },
+        "llm": {
+          "repo": "unsloth/Qwen3-4B-Instruct-2507-GGUF",
+          "file": "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+          "size": 2497281120,
+          "sha256": "3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597"
+        }
+      },
+      "defaults": {
+        "image": {
+          "steps": 8,
+          "cfg_scale": 1.0,
+          "width": 1024,
+          "height": 1024
+        }
+      }
+    },
+    {
+      "id": "flux2-klein-4b",
+      "title": "FLUX.2 klein 4B",
+      "kind": "image",
+      "detail": "Black Forest Labs 的 4B 蒸馏版，4 步出图，也能按参考图改图",
+      "match": [
+        "flux[-_.]?2[-_.]?klein[-_.]?4b"
+      ],
+      "main": "diffusion_model",
+      "edits": true,
+      "recommended": {
+        "repo": "leejet/FLUX.2-klein-4B-GGUF",
+        "file": "flux-2-klein-4b-Q4_0.gguf",
+        "size": 2460378560,
+        "sha256": "d1023499ef3f2f82ff7c50e6778495195c1b6cc34835741778868428111f9ff4"
+      },
+      "components": {
+        "vae": {
+          "repo": "Comfy-Org/flux2-klein-4B",
+          "file": "split_files/vae/flux2-vae.safetensors",
+          "size": 336211292,
+          "sha256": "868fe7b343cc8f3a19dbcfcafbc3d5f888802be3f89bd81b65b3621a066ce8f3"
+        },
+        "llm": {
+          "repo": "unsloth/Qwen3-4B-GGUF",
+          "file": "Qwen3-4B-Q4_K_M.gguf",
+          "size": 2497281312,
+          "sha256": "f6f851777709861056efcdad3af01da38b31223a3ba26e61a4f8bf3a2195813a"
+        }
+      },
+      "defaults": {
+        "image": {
+          "steps": 4,
+          "cfg_scale": 1.0,
+          "sampler": "euler",
+          "width": 1024,
+          "height": 1024
+        }
+      }
+    },
+    {
+      "id": "qwen-image",
+      "title": "Qwen-Image",
+      "kind": "image",
+      "detail": "通义 20B 文生图，复杂中文排版最好；大，要 16 GB 显存加内存分担",
+      "match": [
+        "qwen[-_ ]?image(?![-_ ]?edit)"
+      ],
+      "main": "diffusion_model",
+      "recommended": {
+        "repo": "QuantStack/Qwen-Image-GGUF",
+        "file": "Qwen_Image-Q4_K_M.gguf",
+        "size": 13065746976,
+        "sha256": "645473886d7dbb0103f84c563c798f7b0867293d919752d4d6be6a432b0bc988"
+      },
+      "components": {
+        "vae": {
+          "repo": "Comfy-Org/Qwen-Image_ComfyUI",
+          "file": "split_files/vae/qwen_image_vae.safetensors",
+          "size": 253806246,
+          "sha256": "a70580f0213e67967ee9c95f05bb400e8fb08307e017a924bf3441223e023d1f"
+        },
+        "llm": {
+          "repo": "unsloth/Qwen2.5-VL-7B-Instruct-GGUF",
+          "file": "Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf",
+          "size": 4683072384,
+          "sha256": "d16776dcd9a28d42758c2958ed3a752aabf20a305252cd64ff2be72b4a78c503"
+        }
+      },
+      "defaults": {
+        "image": {
+          "steps": 20,
+          "cfg_scale": 2.5,
+          "sampler": "euler",
+          "flow_shift": 3.0,
+          "width": 1024,
+          "height": 1024
+        }
+      }
+    },
+    {
+      "id": "wan2.2-ti2v-5b",
+      "title": "Wan2.2 TI2V 5B",
+      "kind": "video",
+      "detail": "通义万相 5B 文生视频 / 图生视频（给起始图就是图生视频），16 GB 显存可跑",
+      "match": [
+        "wan[-_ ]?2\\.?2[-_ ]?ti2v[-_ ]?5b"
+      ],
+      "main": "diffusion_model",
+      "recommended": {
+        "repo": "QuantStack/Wan2.2-TI2V-5B-GGUF",
+        "file": "Wan2.2-TI2V-5B-Q4_K_M.gguf",
+        "size": 3433116000,
+        "sha256": "95b19697b7f98e65b0a543640e9ca7b4dfec32e2a6e3731e8e10708be52655e2"
+      },
+      "components": {
+        "vae": {
+          "repo": "QuantStack/Wan2.2-TI2V-5B-GGUF",
+          "file": "VAE/Wan2.2_VAE.safetensors",
+          "size": 1409400960,
+          "sha256": "e40321bd36b9709991dae2530eb4ac303dd168276980d3e9bc4b6e2b75fed156"
+        },
+        "t5xxl": {
+          "repo": "city96/umt5-xxl-encoder-gguf",
+          "file": "umt5-xxl-encoder-Q4_K_M.gguf",
+          "size": 3655145312,
+          "sha256": "17cf97a5bbbc60a646d6105b832b6f657ce904a8a1ad970e4b59df0c67584a40"
+        }
+      },
+      "defaults": {
+        "video": {
+          "steps": 30,
+          "cfg_scale": 6.0,
+          "sampler": "euler",
+          "flow_shift": 3.0,
+          "width": 832,
+          "height": 480,
+          "frames": 33,
+          "fps": 16,
+          "negative_prompt": "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+        }
+      }
+    }
+  ],
+  "models": [],
+  "targets": {
+    "windows-x64-vulkan": {
+      "detail": "Windows x64，Vulkan（单个 exe，NVIDIA / AMD / Intel 显卡都能用；默认）",
+      "models": []
+    },
+    "windows-x64-cuda": {
+      "detail": "Windows x64，NVIDIA CUDA（带 cuBLAS，包大）",
+      "models": []
+    },
+    "macos-arm64-metal": {
+      "detail": "macOS，Apple 芯片，Metal",
+      "models": []
+    },
+    "linux-x64-vulkan": {
+      "detail": "Linux x64，Vulkan（默认）",
+      "models": []
+    },
+    "linux-x64-cuda": {
+      "detail": "Linux x64，NVIDIA CUDA（cudart、cuBLAS 静态链接，包大）",
+      "models": []
+    },
+    "linux-arm64-jetson-orin": {
+      "detail": "Jetson Orin（JetPack 6.x）",
+      "models": []
+    },
+    "linux-arm64-vulkan": {
+      "detail": "ARM64 Linux，Vulkan（要 ARMv8.2 的 CPU）",
+      "models": []
+    }
+  }
+}

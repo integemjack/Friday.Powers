@@ -64,3 +64,15 @@ pwsh llm/scripts/build-windows.ps1 -Backend cuda        # 或 vulkan
 llm/build-cuda/bin/friday-llm serve --models <模型库目录> --port 0
 python llm/tools/concurrency_test.py --url http://127.0.0.1:端口 --model 组织/仓库:量化档
 ```
+
+## 第三个 Power：`diffusion`（本地生图 / 生视频，v2.7）
+
+- stable-diffusion.cpp（master-951，带它自己那份 ggml）：生图（Z-Image-Turbo、FLUX.2 klein、Qwen-Image）、按参考图改图、生视频（Wan2.2 TI2V 5B，WebM）；
+- 一个模型要的配套文件（VAE、文本编码器）由清单里的**模型家族**（`families`）说明：Friday 的模型库据此认仓库、一起下载；
+- 任务异步（`/v1/jobs`，进度、取消），也有 OpenAI 兼容的同步生图；空闲 10 分钟释放模型、腾显存给大模型。
+- 实测（RTX 5080）：Z-Image-Turbo 768×768 一张 5.5 秒；Wan2.2 TI2V 5B 832×480 17 帧约 65 秒。接口见 [docs/diffusion-protocol.md](docs/diffusion-protocol.md)。
+
+```
+pwsh diffusion/scripts/build-windows.ps1 -Backend cuda   # 或 vulkan
+diffusion/build-cuda/bin/friday-diffusion serve --port 0
+```

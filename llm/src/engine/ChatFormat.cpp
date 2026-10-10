@@ -294,6 +294,9 @@ int ChatFormat::prepare(json body, ChatRequest& out, std::string* error) const
             for (const auto& item : body["chat_template_kwargs"].items())
                 inputs.chat_template_kwargs[item.key()] = item.value().dump();
         }
+        // 顶层的 enable_thinking（百炼的写法，Friday 的本地引擎这样发）：模板参数里没给时当成 chat_template_kwargs.enable_thinking
+        if (body.contains("enable_thinking") && body["enable_thinking"].is_boolean() && !inputs.chat_template_kwargs.count("enable_thinking"))
+            inputs.chat_template_kwargs["enable_thinking"] = body["enable_thinking"].get<bool>() ? "true" : "false";
         {
             const auto it = inputs.chat_template_kwargs.find("enable_thinking");
             const std::string kwarg = it == inputs.chat_template_kwargs.end() ? std::string() : it->second;

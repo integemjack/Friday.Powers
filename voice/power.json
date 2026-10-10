@@ -110,6 +110,26 @@
         "campplus"
       ]
     },
+    "linux-x64-vulkan": {
+      "detail": "Linux x64，Vulkan（NVIDIA / AMD / Intel 显卡都能用；默认）",
+      "models": [
+        "sensevoice-small-q8",
+        "fsmn-vad",
+        "whisper-large-v3-turbo-q5",
+        "cosyvoice3-q8",
+        "campplus"
+      ]
+    },
+    "linux-x64-cuda": {
+      "detail": "Linux x64，NVIDIA CUDA（cudart、cuBLAS 静态链接，包大；Vulkan 有问题时备选）",
+      "models": [
+        "sensevoice-small-q8",
+        "fsmn-vad",
+        "whisper-large-v3-turbo-q5",
+        "cosyvoice3-q8",
+        "campplus"
+      ]
+    },
     "linux-arm64-jetson-orin": {
       "detail": "Jetson Orin（JetPack 6.x）",
       "models": [
@@ -118,18 +138,6 @@
         "whisper-large-v3-turbo-q5",
         "cosyvoice3-q4km",
         "campplus"
-      ]
-    },
-    "linux-arm64-jetson-nano": {
-      "detail": "初代 Jetson Nano（JetPack 4）：只用 CPU 听写，合成用在线服务",
-      "models": [
-        "sensevoice-small-q8",
-        "fsmn-vad",
-        "campplus"
-      ],
-      "capabilities": [
-        "transcription",
-        "realtimeTranscription"
       ]
     },
     "linux-arm64-vulkan": {

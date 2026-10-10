@@ -1,0 +1,60 @@
+{
+  "schema": 2,
+  "id": "llm",
+  "title": "本地大模型",
+  "detail": "用本机 GPU 跑大模型（llama.cpp）：多个请求一起算，主智能体和同时派出的子智能体共用系统提示、不重复算（基数树前缀共享）；模型在模型库里选、按需下载（魔搭 / Hugging Face 上的 GGUF）；不联网、不花钱。",
+  "executable": "friday-llm",
+  "serve": [
+    "serve",
+    "--models",
+    "{library}",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "0",
+    "--token",
+    "{token}",
+    "--parent-stdin"
+  ],
+  "capabilities": [
+    "chat"
+  ],
+  "library": {
+    "format": "gguf",
+    "kinds": [
+      "text",
+      "multimodal"
+    ]
+  },
+  "models": [],
+  "targets": {
+    "windows-x64-vulkan": {
+      "detail": "Windows x64，Vulkan（单个 exe，NVIDIA / AMD / Intel 显卡都能用；默认）",
+      "models": []
+    },
+    "windows-x64-cuda": {
+      "detail": "Windows x64，NVIDIA CUDA（带 cuBLAS，包大；预填长提示更快）",
+      "models": []
+    },
+    "macos-arm64-metal": {
+      "detail": "macOS，Apple 芯片，Metal",
+      "models": []
+    },
+    "linux-x64-vulkan": {
+      "detail": "Linux x64，Vulkan（NVIDIA / AMD / Intel 显卡都能用；默认）",
+      "models": []
+    },
+    "linux-x64-cuda": {
+      "detail": "Linux x64，NVIDIA CUDA（cudart、cuBLAS 静态链接，包大）",
+      "models": []
+    },
+    "linux-arm64-jetson-orin": {
+      "detail": "Jetson Orin（JetPack 6.x）",
+      "models": []
+    },
+    "linux-arm64-vulkan": {
+      "detail": "ARM64 Linux，Vulkan（高通 Adreno 等，要 ARMv8.2 的 CPU）",
+      "models": []
+    }
+  }
+}

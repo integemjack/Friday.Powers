@@ -66,7 +66,18 @@ cmake -S "$src" -B "$build" "${generator[@]}" "${common[@]}" "${args[@]}"
 cmake --build "$build" -j"$(nproc)" --target "$exe"
 
 bin="$build/bin/$exe"
-"$bin" --version
+# stable-diffusion.cpp 直接链接驱动的 libcuda（Linux 上没法延迟加载）：CI 机器没装 NVIDIA 驱动时程序起不来，只看依赖。
+# 用户机器上 Friday 只在有 libcuda 时才提供 CUDA 包
+if ! version=$("$bin" --version 2>&1); then
+    if [[ "$version" == *"libcuda.so"* ]]; then
+        echo "（这台机器没有 NVIDIA 驱动，缺 libcuda：不跑 --version）"
+    else
+        echo "$version" >&2
+        exit 1
+    fi
+else
+    echo "$version"
+fi
 echo "── 动态依赖（只该有 glibc 一族，libcuda / libvulkan 由驱动提供）"
 ldd "$bin" || true
 echo "── 要求的最高 glibc：$(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"

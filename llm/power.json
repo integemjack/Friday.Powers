@@ -32,9 +32,10 @@
       "detail": "Windows x64，Vulkan（单个 exe，NVIDIA / AMD / Intel 显卡都能用；默认）",
       "models": []
     },
-    "windows-x64-cuda": {
-      "detail": "Windows x64，NVIDIA CUDA（带 cuBLAS，包大；预填长提示更快）",
-      "models": []
+    "windows-x64-cuda13": {
+      "detail": "Windows x64，NVIDIA CUDA（cuBLAS 在共用的 CUDA 13 运行库里，第一次装 CUDA 版时下载；预填长提示更快）",
+      "models": [],
+      "runtime": "cuda13"
     },
     "macos-arm64-metal": {
       "detail": "macOS，Apple 芯片，Metal",

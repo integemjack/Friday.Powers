@@ -32,7 +32,7 @@ Friday 主程序只接在线模型、保持小巧；要用到本机 GPU 的重�
 | 平台 | 加速 | 说明 |
 |---|---|---|
 | `windows-x64-vulkan` | Vulkan | 单个 exe（约 49 MB），NVIDIA / AMD / Intel 都能用；默认 |
-| `windows-x64-cuda` | CUDA 13 | 带 cuBLAS 的 DLL（约 420 MB）；RTX 5080 上 Vulkan 反而更快，留作备选 |
+| `windows-x64-cuda13` | CUDA 13 | cuBLAS 在共用的运行库 `cuda13` 里（约 380 MB，各 Power 的 CUDA 版共用一份，见 docs/power-spec.md §1.1）；RTX 5080 上 Vulkan 反而更快，留作备选 |
 | `macos-arm64-metal` | Metal | Apple 芯片的 Mac |
 | `linux-x64-vulkan` | Vulkan | x64 Linux（glibc 2.35 起，同 Friday 的 Linux x64 包）；NVIDIA / AMD / Intel 都能用；默认 |
 | `linux-x64-cuda` | CUDA 13 | x64 Linux + NVIDIA；cudart、cuBLAS 静态链接，留作备选 |

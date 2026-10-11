@@ -28,7 +28,7 @@ jobs:
             backend: vulkan
             runner: windows-2025
           # CUDA 13.0 只认 VS 2019–2022，windows-2025 上的 VS 太新
-          - target: windows-x64-cuda
+          - target: windows-x64-cuda13
             backend: cuda
             runner: windows-2022
     steps:
@@ -73,12 +73,8 @@ jobs:
       - name: 打包
         shell: pwsh
         run: |
-          $extra = @()
-          if ('${{ matrix.backend }}' -eq 'cuda') {
-            $extra = Get-ChildItem -Recurse "$env:CUDA_PATH\bin" -Include 'cublas64_*.dll', 'cublasLt64_*.dll' | ForEach-Object FullName
-            if ($extra.Count -lt 2) { throw "没找到 cuBLAS 的 DLL" }
-          }
-          python ci/package.py --power llm --target ${{ matrix.target }} --build build --out dist --extra @extra
+          # CUDA 版（windows-x64-cuda13）不带 cuBLAS：在共用的运行库 cuda13 里（runtimes/cuda13.json），Friday 第一次装 CUDA 版时下载
+          python ci/package.py --power llm --target ${{ matrix.target }} --build build --out dist
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
@@ -207,9 +203,5 @@ jobs:
           gh release create "$TAG" dist/llm-*.zip dist/llm-*.tar.gz --title "$TAG" \
             --notes "friday-llm ${TAG#llm-v}：本地大模型（llama.cpp），多并发 + 基数树前缀共享。各平台包见附件，Friday 2.7 起通过 index 里的 index-v2.json 按需下载。" \
             || gh release upload "$TAG" dist/llm-*.zip dist/llm-*.tar.gz --clobber
-          gh release view index >/dev/null 2>&1 || gh release create index --title "index" --notes "Friday 读的 Power 索引（index-v2.json、index.json），每次发 Power 时更新。" --latest=false
-          mkdir -p previous
-          gh release download index -p index.json -D previous || true
-          gh release download index -p index-v2.json -D previous || true
-          python3 ci/make_index.py --power llm --dist dist --tag "$TAG" --repo "$GITHUB_REPOSITORY" --previous previous --out out
-          gh release upload index out/index.json out/index-v2.json --clobber
+          # index Release 的两份索引：合进这一项、上传、隔一会儿核对（几个发布任务同时改时被盖掉了就重来，见 ci/publish_index.py）
+          python3 ci/publish_index.py --power llm --dist dist --tag "$TAG" --repo "$GITHUB_REPOSITORY"

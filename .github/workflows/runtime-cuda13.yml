@@ -1,0 +1,62 @@
+# 共用运行库 cuda13（cuBLAS）：Windows 上本地能力的 CUDA 版（windows-x64-cuda13）不再各自带 cuBLAS，共用这一份（runtimes/cuda13.json）。
+# 推 cuda13-vX.Y.Z 标签（X.Y.Z 是 CUDA 工具包的版本）时打包、发 Release，并写进 index Release 里 index-v2.json 的 runtimes。
+name: runtime-cuda13
+
+on:
+  push:
+    tags: ['cuda13-v*']
+  workflow_dispatch:
+
+concurrency:
+  group: runtime-cuda13-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: windows-x64
+    # CUDA 13.0 只认 VS 2019–2022，和各 Power 的 windows-x64-cuda13 用同一个工具包
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - name: 装 CUDA 13.0
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '13.0.0'
+          method: local
+          log-file-suffix: 'runtime-cuda13.txt'
+      - name: 打包
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -Recurse "$env:CUDA_PATH\bin" -Include 'cublas64_*.dll', 'cublasLt64_*.dll' | ForEach-Object FullName
+          if ($files.Count -lt 2) { throw "没找到 cuBLAS 的 DLL" }
+          $license = Join-Path $env:CUDA_PATH 'EULA.txt'
+          if (-not (Test-Path $license)) { throw "没找到 EULA.txt" }
+          $version = '${{ github.ref_name }}' -replace '^cuda13-v', ''
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { $version = '13.0.0' }
+          python ci/package_runtime.py --runtime cuda13 --platform windows-x64 --version $version --files @files --license $license --out dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-x64
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/cuda13-v')
+    needs: [windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: 发布
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/cuda13-*.zip --title "$TAG" --latest=false \
+            --notes "NVIDIA CUDA ${TAG#cuda13-v} 运行库（cuBLAS）：Windows 上本地能力的 CUDA 版共用这一份，Friday 2.7.1 起第一次装 CUDA 版的本地能力时下载。按 NVIDIA CUDA Toolkit EULA 随应用再分发（包里 LICENSES/）。" \
+            || gh release upload "$TAG" dist/cuda13-*.zip --clobber
+          python3 ci/publish_index.py --runtime cuda13 --dist dist --tag "$TAG" --repo "$GITHUB_REPOSITORY"

@@ -90,15 +90,16 @@
         "campplus"
       ]
     },
-    "windows-x64-cuda": {
-      "detail": "Windows x64，NVIDIA CUDA（包里带 cuBLAS，约 420 MB；Vulkan 不好用时再选）",
+    "windows-x64-cuda13": {
+      "detail": "Windows x64，NVIDIA CUDA（cuBLAS 在共用的 CUDA 13 运行库里，第一次装 CUDA 版时下载；Vulkan 不好用时再选）",
       "models": [
         "sensevoice-small-q8",
         "fsmn-vad",
         "whisper-large-v3-turbo-q5",
         "cosyvoice3-q8",
         "campplus"
-      ]
+      ],
+      "runtime": "cuda13"
     },
     "macos-arm64-metal": {
       "detail": "macOS（Apple 芯片），Metal",

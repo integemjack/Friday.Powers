@@ -25,7 +25,7 @@ Power 是 Friday 按需下载、按需启动、可以热加载 / 卸载的本地
       "capabilities": ["transcription", "realtimeTranscription"],
       "targets": {
         "windows-x64-vulkan": { "url": "…", "sha256": "…", "size": 0 },
-        "windows-x64-cuda":   { "url": "…", "sha256": "…", "size": 0 },
+        "windows-x64-cuda13": { "url": "…", "sha256": "…", "size": 0, "runtime": "cuda13" },
         "macos-arm64-metal":  { "url": "…", "sha256": "…", "size": 0 },
         "linux-x64-vulkan":   { "url": "…", "sha256": "…", "size": 0 },
         "linux-x64-cuda":     { "url": "…", "sha256": "…", "size": 0 },
@@ -39,6 +39,31 @@ Power 是 Friday 按需下载、按需启动、可以热加载 / 卸载的本地
 
 target 命名：`<os>-<arch>-<加速>`。Friday 按本机情况挑：Windows / Linux x64 默认 vulkan，有 NVIDIA 驱动时可选 cuda；
 Jetson 按 `/etc/nv_tegra_release` 认 Orin（R36）；初代 Jetson Nano（R32）v2.7 起不支持。
+
+### 1.1 共用运行库（runtimes，v2.7.1 起）
+
+Windows 上的 CUDA 版不能把 cuBLAS 静态链进去（NVIDIA 只给 DLL），以前每个 Power 的 `windows-x64-cuda` 包各带一份
+（`cublas64_13.dll` 48 MB + `cublasLt64_13.dll` 456 MB），三个都装就是三份。现在 cuBLAS 单独发一个**运行库** `cuda13`
+（`runtimes/cuda13.json`，推 `cuda13-vX.Y.Z` 标签发，X.Y.Z 是 CUDA 工具包的版本），各 Power 的 CUDA 版改叫 `windows-x64-cuda13`、
+包里不带 cuBLAS，target 写 `"runtime": "cuda13"`。`index-v2.json` 多一段：
+
+```json
+"runtimes": {
+  "cuda13": {
+    "id": "cuda13", "title": "NVIDIA CUDA 13 运行库", "version": "13.0.0", "release": "cuda13-v13.0.0",
+    "packages": { "windows-x64": { "url": "…/cuda13-13.0.0-windows-x64.zip", "sha256": "…", "size": 0 } }
+  }
+}
+```
+
+- Friday（2.7.1 起）装一个 target 写了 runtime 的包时，本机还没有这个版本的运行库就先下（解到 `Powers/runtimes/<id>/<版本>/`，
+  旁边记 sha256），拉起这个 Power 时把运行库目录加到 `PATH` 前面（Linux 是 `LD_LIBRARY_PATH`）；没有哪个装着的 Power 再用它时删掉。
+- 改名是为了让不认运行库的旧版 Friday 看不到这些包：旧版只认 `windows-x64-cuda`，装着它的停在最后一个自带 cuBLAS 的版本，不会更新到缺 DLL 的包；
+  新装的照常挑 vulkan。新版 Friday 看到装着的是 `windows-x64-cuda`、新版本只有 `windows-x64-cuda13` 时自动换过去。
+- Linux 的 CUDA 版（`linux-x64-cuda`、Jetson）cudart、cuBLAS 都静态链接，不用运行库。
+
+几个 Power / 运行库可能同时在发布，都要改 `index` Release 的两份索引：发布任务用 `ci/publish_index.py`（合进这一项、上传、
+隔一会儿再下载核对，被别的任务盖掉了就重来）。
 
 schema 2 的清单多两个字段：`library`（`{format: "gguf", kinds: ["text","multimodal"] | ["image","video"]}`：模型在模型库里选）、
 `families`（diffusion 的模型家族，见 [diffusion-protocol.md](diffusion-protocol.md) §1）。

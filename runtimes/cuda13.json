@@ -1,0 +1,6 @@
+{
+  "id": "cuda13",
+  "title": "NVIDIA CUDA 13 运行库",
+  "detail": "cuBLAS（cublas64_13.dll、cublasLt64_13.dll）：Windows 上本地能力的 CUDA 版共用这一份，第一次装 CUDA 版的本地能力时下载",
+  "license": "NVIDIA CUDA Toolkit EULA（随应用再分发的组件）"
+}

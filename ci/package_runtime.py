@@ -56,7 +56,7 @@ def main():
     info = {"runtime": args.runtime, "platform": args.platform, "version": args.version, "file": name,
             "sha256": sha256(archive), "size": archive.stat().st_size}
     (out / f"{args.runtime}-{args.version}-{args.platform}.json").write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
-    print(f"{name}：{info['size'] / 1048576:.1f} MB，{info['sha256']}")
+    print(json.dumps(info))
 
 
 if __name__ == "__main__":

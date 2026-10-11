@@ -387,6 +387,32 @@ std::string guessMemoryKind(const std::string& ggufPath)
     return swa ? "swa" : "attention";
 }
 
+/// MoE 模型：GGUF 里「<架构>.expert_count」大于 0
+static bool isMixtureOfExperts(const std::string& ggufPath)
+{
+    gguf_init_params init {};
+    init.no_alloc = true;
+    init.ctx = nullptr;
+    gguf_context* ctx = gguf_init_from_file(ggufPath.c_str(), init);
+    if (!ctx)
+        return false;
+    static const std::string suffix = ".expert_count";
+    bool moe = false;
+    const int64_t count = gguf_get_n_kv(ctx);
+    for (int64_t i = 0; i < count && !moe; ++i) {
+        const std::string key = gguf_get_key(ctx, i);
+        if (key.size() <= suffix.size() || key.compare(key.size() - suffix.size(), suffix.size(), suffix) != 0)
+            continue;
+        const gguf_type type = gguf_get_kv_type(ctx, i);
+        if (type == GGUF_TYPE_UINT32)
+            moe = gguf_get_val_u32(ctx, i) > 0;
+        else if (type == GGUF_TYPE_INT32)
+            moe = gguf_get_val_i32(ctx, i) > 0;
+    }
+    gguf_free(ctx);
+    return moe;
+}
+
 std::unique_ptr<Runtime> Runtime::load(const LoadOptions& options, flr_progress_fn progress, void* user, LoadError& error)
 {
     const auto fail = [&error](int code, const std::string& message) -> std::unique_ptr<Runtime> {
@@ -419,8 +445,12 @@ std::unique_ptr<Runtime> Runtime::load(const LoadOptions& options, flr_progress_
     // MARK: 参数（== llama-server 的命令行；-np 是序列数，内部工作序列下面再加）
     // fit 显存不够时先把上下文往下压，最低压到 --fit-ctx（llama.cpp 缺省 4096），还不够才把层挪到内存里。
     // Friday 的系统提示加工具定义就有一万多 token，4096 的池子什么请求都装不下：宁可少放几层到显卡，也保住 32K
-    // （为生图 / 生视频留显存时就会压到这里；模型的训练上下文本来就更小时 fit 不改它）。FRIDAY_LLAMA_ARGS 可以覆盖
-    std::vector<std::string> args { "-m", options.modelPath, "-np", std::to_string(sequences), "-kvu", "--jinja", "--fit-ctx", "32768" };
+    // （为生图 / 生视频留显存时就会压到这里；模型的训练上下文本来就更小时 fit 不改它）。FRIDAY_LLAMA_ARGS 可以覆盖。
+    // 0.1.2 MoE 模型保住 128K：fit 往内存挪的是专家张量（注意力留在显卡上），只激活一小部分、挪了也不怎么慢；
+    // 稠密模型挪的是整层，慢得多，仍 32K（实测 RTX 5080 16 GB：Qwen3.6-35B-A3B IQ4_XS 以前被压到 32K）
+    const bool moe = isMixtureOfExperts(options.modelPath);
+    std::vector<std::string> args { "-m", options.modelPath, "-np", std::to_string(sequences), "-kvu", "--jinja",
+                                    "--fit-ctx", moe ? "131072" : "32768" };
     if (!options.mmprojPath.empty()) {
         args.push_back("--mmproj");
         args.push_back(options.mmprojPath);
@@ -489,8 +519,8 @@ std::unique_ptr<Runtime> Runtime::load(const LoadOptions& options, flr_progress_
     params.load_progress_callback = &LoadProgress::trampoline;
     params.load_progress_callback_user_data = &loadProgress;
 
-    logf(FLR_LOG_NOTICE, "加载模型：%s（%s，-c %d，序列 %d + 工作序列 1，同时 %d 个请求，-b %d，-ub %d，fit %s）", params.model.path.c_str(),
-         guessed.c_str(), params.n_ctx, nSeq, parallel, params.n_batch, params.n_ubatch, params.fit_params ? "开" : "关");
+    logf(FLR_LOG_NOTICE, "加载模型：%s（%s%s，-c %d，序列 %d + 工作序列 1，同时 %d 个请求，-b %d，-ub %d，fit %s）", params.model.path.c_str(),
+         guessed.c_str(), moe ? "、MoE" : "", params.n_ctx, nSeq, parallel, params.n_batch, params.n_ubatch, params.fit_params ? "开" : "关");
     const double vramBefore = usedVramMiB();
     runtime->m_init = common_init_from_params(params);
     params.load_progress_callback = nullptr;

@@ -1,13 +1,14 @@
 // friday-llm：Friday 的本地大模型 Power（llama.cpp + 自己的调度：连续批处理、多序列并发、基数树前缀共享）。
 //
 //   friday-llm serve  [--models DIR]… [--host 127.0.0.1] [--port 0] [--token T] [--parent-stdin]
-//                     [--parallel 4] [--sequences 0] [--ctx 0] [--per-sequence 0] [--llama-arg ARG]… [--preload MODEL] [--verbose]
+//                     [--parallel 0] [--sequences 0] [--ctx 0] [--per-sequence 0] [--llama-arg ARG]… [--preload MODEL] [--verbose]
 //   friday-llm info
 //   friday-llm --version
 //
 // serve 就绪后在 stdout 打一行 {"event":"listening","url":"http://127.0.0.1:端口"}；--parent-stdin 时 stdin 关了就退出
 // （Friday 拉起时用，Friday 退出 / 崩溃 Power 跟着走）。日志都在 stderr。模型按请求加载（docs/llm-protocol.md）。
-// 环境变量 FRIDAY_LLAMA_ARGS（空格分开）追加给 llama 的参数，调试用。
+// 环境变量 FRIDAY_LLAMA_ARGS（空格分开）追加给 llama 的参数，调试用；没给 --parallel 时看 FRIDAY_LLM_PARALLEL
+// （Friday 设置里选的「同时处理几个请求」，0 / 不设 = 按显存自动）。
 #include "ModelHost.h"
 #include "RuntimeLog.h"
 #include "Server.h"
@@ -43,7 +44,7 @@ struct Options {
     std::string command;
     std::vector<std::string> models;
     std::string host = "127.0.0.1", token, preload;
-    int port = 0, parallel = 4, sequences = 0, ctx = 0, perSequence = 0;
+    int port = 0, parallel = -1, sequences = 0, ctx = 0, perSequence = 0;
     bool parentStdin = false, verbose = false;
     std::vector<std::string> llamaArgs;
 };
@@ -53,7 +54,7 @@ void usage()
     std::fprintf(stderr,
                  "friday-llm %s —— Friday 的本地大模型（llama.cpp %s）\n\n"
                  "  friday-llm serve  [--models DIR]… [--host 127.0.0.1] [--port 0] [--token T] [--parent-stdin]\n"
-                 "                    [--parallel 4]（同时在算的请求）[--sequences 0]（缓存的序列，0 = 按模型自动）\n"
+                 "                    [--parallel 0]（同时在算的请求，0 = 按显存自动）[--sequences 0]（缓存的序列，0 = 按模型自动）\n"
                  "                    [--ctx 0]（KV 池，0 = 按显存自动）[--per-sequence 0]（单序列上限）\n"
                  "                    [--llama-arg ARG]…（追加给 llama 的参数）[--preload 模型]（启动就加载）[--verbose]\n"
                  "  friday-llm info\n"
@@ -217,7 +218,11 @@ int main(int argc, char** argv)
 
     llm::HostOptions hostOptions;
     hostOptions.modelRoots = o.models;
-    hostOptions.parallel = std::max(1, o.parallel);
+    if (o.parallel < 0) {
+        const char* chosen = std::getenv("FRIDAY_LLM_PARALLEL");
+        o.parallel = chosen ? std::atoi(chosen) : 0;
+    }
+    hostOptions.parallel = std::max(0, o.parallel);
     hostOptions.sequences = o.sequences;
     hostOptions.contextTokens = o.ctx;
     hostOptions.perSequence = o.perSequence;
@@ -246,7 +251,10 @@ int main(int argc, char** argv)
                 flr::logf(FLR_LOG_ERROR, "预加载失败：%s", error.c_str());
         }
     }
-    flr::logf(FLR_LOG_NOTICE, "friday-llm %s 在 %s 上听（同时 %d 个请求）", LLM_VERSION, server.url().c_str(), hostOptions.parallel);
+    if (hostOptions.parallel > 0)
+        flr::logf(FLR_LOG_NOTICE, "friday-llm %s 在 %s 上听（同时 %d 个请求）", LLM_VERSION, server.url().c_str(), hostOptions.parallel);
+    else
+        flr::logf(FLR_LOG_NOTICE, "friday-llm %s 在 %s 上听（同时几个请求按显存定）", LLM_VERSION, server.url().c_str());
     std::printf("%s\n", json { { "event", "listening" }, { "url", server.url() }, { "version", LLM_VERSION } }.dump().c_str());
     std::fflush(stdout);
 

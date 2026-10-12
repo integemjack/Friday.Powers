@@ -27,6 +27,15 @@ struct ItemKey {
     }
 };
 
+/// 一段账本项占的 KV 格子数
+size_t cellsOf(std::vector<LedgerItem>::const_iterator begin, std::vector<LedgerItem>::const_iterator end)
+{
+    size_t cells = 0;
+    for (auto it = begin; it != end; ++it)
+        cells += size_t(std::max(1, it->n_tokens));
+    return cells;
+}
+
 } // namespace
 
 struct RadixTree::Node {
@@ -38,6 +47,8 @@ struct RadixTree::Node {
     std::map<ItemKey, std::unique_ptr<Node>> children;
     /// 经过这条边的序列（账本至少走到这条边末尾）
     std::set<int> holders;
+    /// 这条边占的 KV 格子数（cellsOf(edge)，改边时跟着改）
+    size_t cells = 0;
 
     size_t end() const { return start + edge.size(); }
 };
@@ -68,6 +79,7 @@ void RadixTree::sync(int seq, const std::vector<LedgerItem>& ledger, uint64_t ge
         Node* leaf = entry.leaf;
         if (leaf != m_root.get() && leaf->holders.size() == 1 && leaf->children.empty()) {
             // 只有它自己的叶子：直接接在边上（逐 token 生成时走这条）
+            leaf->cells += cellsOf(ledger.begin() + std::ptrdiff_t(entry.length), ledger.end());
             leaf->edge.insert(leaf->edge.end(), ledger.begin() + std::ptrdiff_t(entry.length), ledger.end());
         } else {
             leaf = insert(leaf, ledger, entry.length, seq);
@@ -89,6 +101,7 @@ RadixTree::Node* RadixTree::insert(Node* node, const std::vector<LedgerItem>& it
         if (found == node->children.end()) {
             auto child = std::make_unique<Node>();
             child->edge.assign(items.begin() + std::ptrdiff_t(from), items.end());
+            child->cells = cellsOf(child->edge.begin(), child->edge.end());
             child->start = node->end();
             child->parent = node;
             child->holders.insert(seq);
@@ -114,6 +127,8 @@ RadixTree::Node* RadixTree::split(Node* node, size_t at)
 {
     auto tail = std::make_unique<Node>();
     tail->edge.assign(node->edge.begin() + std::ptrdiff_t(at), node->edge.end());
+    tail->cells = cellsOf(tail->edge.begin(), tail->edge.end());
+    node->cells -= std::min(node->cells, tail->cells);
     tail->start = node->start + at;
     tail->parent = node;
     tail->holders = node->holders;
@@ -174,6 +189,7 @@ void RadixTree::compact(Node* node)
         if (child->holders != node->holders)
             break;
         node->edge.insert(node->edge.end(), child->edge.begin(), child->edge.end());
+        node->cells += child->cells;
         for (auto& [seq, entry] : m_entries) {
             if (entry.leaf == child)
                 entry.leaf = node;
@@ -261,6 +277,24 @@ size_t RadixTree::sharedWithOthers(int seq) const
     return it->second.length - std::min(it->second.length, exclusive(seq));
 }
 
+size_t RadixTree::cells(const std::set<int>& seqs) const
+{
+    // 每个序列从叶子往根走，走过的节点只算一次（碰到算过的就停：它往上的也都算过了）
+    std::set<const Node*> seen;
+    size_t total = 0;
+    for (const int seq : seqs) {
+        const auto it = m_entries.find(seq);
+        if (it == m_entries.end())
+            continue;
+        for (const Node* node = it->second.leaf; node && node != m_root.get(); node = node->parent) {
+            if (!seen.insert(node).second)
+                break;
+            total += node->cells;
+        }
+    }
+    return total;
+}
+
 RadixTree::Stats RadixTree::stats() const
 {
     Stats stats;
@@ -271,6 +305,7 @@ RadixTree::Stats RadixTree::stats() const
         if (node != m_root.get()) {
             ++stats.nodes;
             stats.items += node->edge.size();
+            stats.cells += node->cells;
         }
         for (const auto& [key, child] : node->children)
             stack.push_back(child.get());

@@ -21,9 +21,10 @@ struct ServerOptions {
     std::string host = "127.0.0.1";
     int port = 0;          // 0 = 自己找一个空闲端口
     std::string token;     // 非空时所有请求要带 Authorization: Bearer <token>
-    int threads = 48;
+    /// 同时开着的连接（每个在算 / 排队的请求占一个，按显存定的并发最多 64，再留些排队和 /v1/info）
+    int threads = 160;
     /// 排队的请求超过这么多就回 429
-    int maxQueued = 64;
+    int maxQueued = 144;
 };
 
 class Server {

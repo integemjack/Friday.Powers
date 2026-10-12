@@ -3,9 +3,11 @@
 // Copyright (c) 2023-2026 The ggml authors）。
 #include "Runtime.h"
 
+#include "Capacity.h"
 #include "RuntimeLog.h"
 
 #include "arg.h"
+#include "fit.h"
 #include "gguf.h"
 #include "preset.h"
 
@@ -413,6 +415,87 @@ static bool isMixtureOfExperts(const std::string& ggufPath)
     return moe;
 }
 
+/// 按现在的参数（只换上下文和序列数）no_alloc 加载一次，量每张卡要多少字节（权重 + 上下文 + 计算空间）。
+/// used 与 devices 一一对应（只有放模型的卡，没有主机内存那一项）；量不了返回 false
+static bool measureDevices(const common_params& params, uint32_t nCtx, int nSeqMax, std::vector<int64_t>& used,
+                    std::vector<ggml_backend_dev_t>& devices, std::vector<int64_t>& free, uint32_t& nCtxTrain)
+{
+    try {
+        common_params copy = params;
+        llama_model_params mparams = common_model_params_to_llama(copy);
+        llama_context_params cparams = common_context_params_to_llama(copy);
+        cparams.n_ctx = nCtx;
+        cparams.n_seq_max = uint32_t(std::max(1, nSeqMax));
+        // 建上下文要求 n_outputs_max ≥ n_seq_max（见 load 里的 applySequences），多量几条序列时跟着提上来
+        cparams.n_batch = std::max(cparams.n_batch, cparams.n_seq_max);
+        cparams.n_outputs_max = std::min(cparams.n_batch, std::max(cparams.n_outputs_max, cparams.n_seq_max));
+        uint32_t layers = 0;
+        uint32_t experts = 0;
+        devices.clear();
+        const common_device_memory_data_vec data = common_get_device_memory_data(params.model.path.c_str(), &mparams, &cparams, devices,
+                                                                                 layers, nCtxTrain, experts, GGML_LOG_LEVEL_ERROR);
+        silenceCommonLog();
+        used.clear();
+        free.clear();
+        for (size_t i = 0; i < devices.size() && i < data.size(); ++i) {
+            used.push_back(int64_t(data[i].model + data[i].context + data[i].compute));
+            free.push_back(data[i].free);
+        }
+        return !used.empty();
+    } catch (const std::exception& exception) {
+        silenceCommonLog();
+        logf(FLR_LOG_WARN, "量显存出错（照旧按训练上下文加载）：%s", exception.what());
+        return false;
+    }
+}
+
+/// 按显存定 KV 池、同时几个请求、缓存几条序列（docs/llm-design.md §4）：量三次——训练上下文、上下文多 128K、序列多 16 条
+/// （混合 / 循环 / 滑窗模型才量），算出每 token、每条序列各占多少，交给 planCapacity。放不下训练上下文时照旧交给 fit
+static CapacityPlan planFromMeasure(const common_params& params, CapacityInput input)
+{
+    std::vector<ggml_backend_dev_t> devices;
+    std::vector<int64_t> base;
+    std::vector<int64_t> free;
+    uint32_t nCtxTrain = 0;
+    if (!measureDevices(params, 0, params.n_parallel, base, devices, free, nCtxTrain) || nCtxTrain == 0)
+        return planCapacity(input);
+    input.nCtxTrain = int(nCtxTrain);
+    constexpr uint32_t kMoreTokens = 131072;
+    std::vector<int64_t> bigger;
+    std::vector<ggml_backend_dev_t> devicesBigger;
+    std::vector<int64_t> ignored;
+    uint32_t ignoredTrain = 0;
+    const bool slope = measureDevices(params, nCtxTrain + kMoreTokens, params.n_parallel, bigger, devicesBigger, ignored, ignoredTrain)
+                       && bigger.size() == base.size();
+    constexpr int kMoreSequences = 16;
+    std::vector<int64_t> more;
+    const bool states = !input.attentionOnly
+                        && measureDevices(params, 0, params.n_parallel + kMoreSequences, more, devicesBigger, ignored, ignoredTrain)
+                        && more.size() == base.size();
+    if (!slope)
+        return planCapacity(input);
+    for (size_t i = 0; i < devices.size(); ++i) {
+        const auto type = ggml_backend_dev_type(devices[i]);
+        DeviceMeasure device;
+        device.name = ggml_backend_dev_name(devices[i]);
+        device.free = free[i];
+        device.used = base[i];
+        device.perToken = std::max<int64_t>(0, (bigger[i] - base[i]) / int64_t(kMoreTokens));
+        device.perSequence = states ? std::max<int64_t>(0, (more[i] - base[i]) / kMoreSequences) : 0;
+        device.margin = i < params.fit_params_target.size() ? int64_t(params.fit_params_target[i]) : int64_t(1024) * 1024 * 1024;
+#if defined(__APPLE__)
+        device.unified = true;
+#else
+        device.unified = type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+#endif
+        // CPU、加速器这类不按显存算（模型整个在内存里时 devices 里没有显卡）
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU)
+            continue;
+        input.devices.push_back(device);
+    }
+    return planCapacity(input);
+}
+
 std::unique_ptr<Runtime> Runtime::load(const LoadOptions& options, flr_progress_fn progress, void* user, LoadError& error)
 {
     const auto fail = [&error](int code, const std::string& message) -> std::unique_ptr<Runtime> {
@@ -434,13 +517,16 @@ std::unique_ptr<Runtime> Runtime::load(const LoadOptions& options, flr_progress_
         return fail(FLR_IO_ERROR, "找不到视觉投影文件：" + options.mmprojPath);
 
     // 序列数：纯注意力模型的序列不占额外显存（统一 KV 池里只是格子上的标记），多留一些缓存着的对话 / 前缀；
-    // 混合 / 循环模型每个序列一份循环状态（Qwen3.5-9B 约 50 MiB），滑窗模型每个序列一份窗口，少留
-    const int parallel = std::max(1, options.parallel);
+    // 混合 / 循环模型每个序列一份循环状态（Qwen3.5-9B 约 50 MiB），滑窗模型每个序列一份窗口，少留。
+    // --parallel 0（缺省）：同时几个请求按显存定（下面 planFromMeasure），先按 4 个算序列数去量显存
+    const bool autoParallel = options.parallel <= 0;
+    int parallel = autoParallel ? kMinParallel : options.parallel;
     const std::string guessed = guessMemoryKind(options.modelPath);
-    int sequences = options.sequences > 0 ? options.sequences : (guessed == "attention" ? 32 : parallel + 4);
+    const bool attentionOnly = guessed == "attention";
+    int sequences = options.sequences > 0 ? options.sequences : defaultSequences(parallel, attentionOnly);
     sequences = std::max(sequences, parallel);
     // llama 的序列号上限 LLAMA_MAX_SEQ = 256（src/llama-cparams.h，不在公开头文件里），留一个给工作序列
-    sequences = std::min(sequences, 255);
+    sequences = std::min(sequences, kMaxSequences);
 
     // MARK: 参数（== llama-server 的命令行；-np 是序列数，内部工作序列下面再加）
     // fit 显存不够时先把上下文往下压，最低压到 --fit-ctx（llama.cpp 缺省 4096），还不够才把层挪到内存里。
@@ -496,24 +582,52 @@ std::unique_ptr<Runtime> Runtime::load(const LoadOptions& options, flr_progress_
     runtime->m_mmprojPath = params.mmproj.path;
 
     // 序列：np 个 + 内部工作序列。统一 KV 池：序列之间 seq_cp 只改元数据、不占池（不统一的话 n_seq_max 会把池子分成几份）
-    const int nSeq = std::max(1, params.n_parallel);
-    params.n_parallel = nSeq + 1;
+    // FRIDAY_LLAMA_ARGS 里给了 -np 的照它，按显存定容量时也不改
+    const bool fixedSequences = options.sequences > 0 || params.n_parallel != sequences;
+    int nSeq = std::max(1, params.n_parallel);
+    const auto applySequences = [&params, &nSeq] {
+        params.n_parallel = nSeq + 1;
+        // 建上下文时 llama 先 output_reserve(n_seq_max)，要求 n_outputs_max ≥ n_seq_max（llama-context.cpp:376 → 2258，不满足就
+        // GGML_ASSERT、整个应用退出）。多了一个工作序列，FRIDAY_LLAMA_ARGS 给的 -b 小于序列数时（-b 4 -np 4：llama-server 照样起得来）
+        // 把批大小提上来（评审修正）
+        if (params.n_batch < params.n_parallel) {
+            logf(FLR_LOG_NOTICE, "批大小 -b %d 小于序列数 %d（-np %d + 工作序列 1），提到 %d", params.n_batch, params.n_parallel, nSeq,
+                 params.n_parallel);
+            params.n_batch = params.n_parallel;
+        }
+        // == server_output_limits（无投机解码）：每个序列一行 logits（n_vocab = 248320 时 n_batch 行会占 2 GB）
+        params.n_outputs_max = std::min(params.n_batch, params.n_parallel);
+    };
     params.kv_unified = true;
-    // 建上下文时 llama 先 output_reserve(n_seq_max)，要求 n_outputs_max ≥ n_seq_max（llama-context.cpp:376 → 2258，不满足就
-    // GGML_ASSERT、整个应用退出）。多了一个工作序列，FRIDAY_LLAMA_ARGS 给的 -b 小于序列数时（-b 4 -np 4：llama-server 照样起得来）
-    // 把批大小提上来（评审修正）
-    if (params.n_batch < params.n_parallel) {
-        logf(FLR_LOG_NOTICE, "批大小 -b %d 小于序列数 %d（-np %d + 工作序列 1），提到 %d", params.n_batch, params.n_parallel, nSeq,
-             params.n_parallel);
-        params.n_batch = params.n_parallel;
-    }
-    // == server_output_limits（无投机解码）：每个序列一行 logits（n_vocab = 248320 时 n_batch 行会占 2 GB）
-    params.n_outputs_max = std::min(params.n_batch, params.n_parallel);
+    applySequences();
     params.n_outputs_max_per_seq = 1;
     // 运行时自己采样（common_sampler），不用后端采样
     params.sampling.backend_sampling = false;
     if (hasMmproj)
         Media::reserveForFit(params.mmproj.path, params);
+
+    // 按显存定容量（docs/llm-design.md §4）：没给 -c、开着 fit 时，量出放下训练上下文之后显卡还剩多少，
+    // 拿一部分多缓存几条序列、放大 KV 池、同时多算几个请求（--parallel 0 时最多 8 个）。放不下训练上下文的照旧交给 fit 往下压
+    if (params.n_ctx == 0 && params.fit_params) {
+        CapacityInput input;
+        input.baseSequences = nSeq;
+        input.attentionOnly = attentionOnly;
+        input.autoParallel = autoParallel;
+        input.fixedParallel = parallel;
+        input.fixedSequences = fixedSequences ? nSeq : 0;
+        const CapacityPlan plan = planFromMeasure(params, input);
+        if (plan.grown) {
+            params.n_ctx = plan.nCtx;
+            parallel = plan.parallel;
+            if (!fixedSequences)
+                nSeq = std::min(plan.sequences, kMaxSequences);
+            applySequences();
+            logf(FLR_LOG_NOTICE, "按显存定容量：KV 池 %d，同时 %d 个请求，序列 %d（%s）", plan.nCtx, parallel, nSeq, plan.why.c_str());
+        } else {
+            logf(FLR_LOG_NOTICE, "按显存定容量：不放大（%s）", plan.why.c_str());
+        }
+        runtime->m_capacity = plan.why;
+    }
 
     loadProgress.stages = hasMmproj ? 2 : 1;
     params.load_progress_callback = &LoadProgress::trampoline;
@@ -631,6 +745,7 @@ std::unique_ptr<Runtime> Runtime::load(const LoadOptions& options, flr_progress_
     config.nSeq = runtime->m_nSeq;
     config.nSeqMax = runtime->m_nSeqMax;
     config.nParallel = runtime->m_nParallel;
+    config.nCtx = runtime->m_nCtx;
     config.special = params.special;
     config.modelName = runtime->m_format->environment().modelName;
     runtime->m_scheduler = std::make_unique<Scheduler>(std::move(config));
@@ -708,6 +823,7 @@ json Runtime::info() const
         { "n_ctx_train", m_nCtxTrain },
         { "parallel", m_nParallel },
         { "sequences", m_nSeq },
+        { "capacity", m_capacity },
         { "vision", m_media && m_media->supportsImages() },
         { "memory", m_memoryKind },
         { "seq_rm", seqRmName(m_seqRm) },

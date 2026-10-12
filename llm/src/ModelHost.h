@@ -20,8 +20,8 @@ using json = flr::json;
 struct HostOptions {
     /// 模型库的目录（可以有几个）
     std::vector<std::string> modelRoots;
-    /// 同时在算的请求最多几个
-    int parallel = 4;
+    /// 同时在算的请求最多几个（0 = 按显存定）
+    int parallel = 0;
     /// 缓存的序列数（0 = 按模型自动）
     int sequences = 0;
     /// KV 池（0 = 按显存自动）

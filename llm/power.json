@@ -26,6 +26,65 @@
       "multimodal"
     ]
   },
+  "options": [
+    {
+      "key": "parallel",
+      "title": "同时处理的请求",
+      "detail": "同时算几个请求（主智能体、每个子智能体各一个），多的排队。自动按显存定；子智能体多、上下文不长时可以调高，上下文很长时调高反而可能更慢。改了以后本地大模型重新启动（正在回答的会被打断）。",
+      "env": "FRIDAY_LLM_PARALLEL",
+      "default": 0,
+      "choices": [
+        {
+          "value": 0,
+          "title": "自动（按显存）"
+        },
+        {
+          "value": 1,
+          "title": "1 个"
+        },
+        {
+          "value": 2,
+          "title": "2 个"
+        },
+        {
+          "value": 4,
+          "title": "4 个"
+        },
+        {
+          "value": 6,
+          "title": "6 个"
+        },
+        {
+          "value": 8,
+          "title": "8 个"
+        },
+        {
+          "value": 12,
+          "title": "12 个"
+        },
+        {
+          "value": 16,
+          "title": "16 个"
+        },
+        {
+          "value": 24,
+          "title": "24 个"
+        },
+        {
+          "value": 32,
+          "title": "32 个"
+        },
+        {
+          "value": 48,
+          "title": "48 个"
+        },
+        {
+          "value": 64,
+          "title": "64 个"
+        }
+      ]
+    }
+  ],
   "models": [],
   "targets": {
     "windows-x64-vulkan": {

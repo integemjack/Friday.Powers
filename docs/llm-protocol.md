@@ -4,15 +4,18 @@
 
 ```
 friday-llm serve --models <模型库目录> [--models <另一个目录>]… --host 127.0.0.1 --port 0 --token <T> --parent-stdin
-                 [--parallel 4] [--sequences 0] [--ctx 0] [--per-sequence 0] [--llama-arg <llama-server 的参数>]…
+                 [--parallel 0] [--sequences 0] [--ctx 0] [--per-sequence 0] [--llama-arg <llama-server 的参数>]…
 ```
 
 - `--models`：Friday 模型库的目录（魔搭布局 `<目录>/<组织>/<仓库>/*.gguf`，HF 布局 `models--组织--仓库/snapshots/*/`）。
-- `--parallel`：同时在算的请求最多几个，其余排队（缺省 4）。
-- `--sequences`：缓存着的序列（对话 / 前缀）最多几条；0 = 按模型自动（纯注意力 32，混合 / 循环 / 滑窗模型 parallel + 4）。
-- `--ctx`：KV 池大小；0 = 模型的训练上下文，按显存往下调（llama.cpp 的 fit）。序列之间共用前缀，池子不必是「序列数 × 单序列上限」。
+- `--parallel`：同时在算的请求最多几个，其余排队。0（缺省，0.2 起）= 按显存定，最多 8 个（见 [llm-design.md](llm-design.md) §4）；没给时看环境变量
+  `FRIDAY_LLM_PARALLEL`（Friday「设置 › 能力」里选的，清单的 `options`，见 [power-spec.md](power-spec.md) §1）。0.1 是固定 4 个。
+- `--sequences`：缓存着的序列（对话 / 前缀）最多几条；0 = 自动（见 llm-design.md §4：放得下训练上下文时按显存最多 64 条；放不下时纯注意力 32、
+  混合 / 循环 / 滑窗模型 parallel + 4）。
+- `--ctx`：KV 池大小；0 = 自动（见 llm-design.md §4：放得下训练上下文时按剩下的显存放大，最多装 32 个会话；放不下时是模型的训练上下文，
+  按显存往下调——llama.cpp 的 fit）。序列之间共用前缀，池子不必是「序列数 × 单序列上限」。
   fit 往下调时最低压到 32K（再不够才把层挪到内存里）；0.1.2 起 MoE 模型（GGUF 的 `<架构>.expert_count` > 0）最低 128K——fit 挪的是专家张量、注意力留在显卡上，只激活一小部分，挪了也不怎么慢（实测 RTX 5080 16 GB：Qwen3.6-35B-A3B IQ4_XS 从 32K 到 128K，生成 46 tok/s）。
-- 环境变量 `FRIDAY_LLAMA_ARGS`（空格分开）追加给 llama 的参数，调试用。
+- 环境变量 `FRIDAY_LLAMA_ARGS`（空格分开）追加给 llama 的参数，调试用（里面给了 `-c` / `-np` 就不按显存定）。
 
 ## 1. 接口
 
@@ -75,14 +78,21 @@ Friday 的预留 = 生图 / 生视频模型文件的大小（主模型 + VAE + �
 
 出错：`{"error":{"message","type","code"}}`。HTTP 状态：请求不对 400（超长 `type: exceed_context_size_error`）、
 模型找不到 404、**KV 池放不下 / 排队太多 429**（Friday 的请求闸门见到 429 会减并发、等一会儿重试）、正在换模型 503、其它 500。
+0.2 起 KV 池不够时新请求先排队（KV 余量放行，llm-design.md §4），只有在算的请求自己把池子撑满了才回 429。
+
+0.2 起对话补全的响应头带 `X-Friday-Parallel: <同时能算几个>`（按显存定的或选的）：Friday 的请求闸门照它定这个本地引擎的并发
+（多发的也只是在这里排队，Friday 那边看不出在排队）。
 流式已经开始以后出错：发一块 `data: {"error":…}` 再 `[DONE]`。
 
 `/v1/info` 的 `model.loaded.cache`：
 
 ```json
-{"parallel":4, "sequences":32, "sequences_used":7, "active":2, "queued":0, "requests":42, "forks":11, "dedupe_waits":3,
- "evictions":1, "tokens_reused":182340, "tokens_shared":66012, "tokens_prefilled":20391,
- "tree":{"nodes":12, "items":41022, "logical":203118}}
+{"parallel":8, "sequences":64, "sequences_used":7, "active":2, "queued":0, "requests":42, "forks":11, "dedupe_waits":3,
+ "evictions":1, "kv_waits":0, "kv":{"cells":524288, "used":41022, "committed":30211},
+ "tokens_reused":182340, "tokens_shared":66012, "tokens_prefilled":20391,
+ "tree":{"nodes":12, "items":41022, "logical":203118, "cells":41022}}
 ```
 
-`tree.items` 是树里的项数（共用的只算一次，≈ KV 里真正占的格子），`tree.logical` 是各序列账本加起来（不共用时要占的）。
+`tree.items` 是树里的项数（共用的只算一次，≈ KV 里真正占的格子），`tree.logical` 是各序列账本加起来（不共用时要占的），
+`tree.cells` 同 `items` 但图片块按 KV 格子算。`kv`（0.2）：`cells` 池子多大，`used` 现在占了多少，`committed` 在算的请求占的加上
+它们还要的（KV 余量放行按它算）；`kv_waits` 是因为池子不够先排着的请求数。`model.loaded` 另有 `capacity`：按显存定容量时怎么量的。

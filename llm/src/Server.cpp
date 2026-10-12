@@ -35,16 +35,23 @@ int64_t nowMs()
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-void reply(mg_connection* conn, int status, const std::string& body, const char* mime = "application/json")
+/// extra：多加的响应头（每行以 \r\n 结尾）
+void reply(mg_connection* conn, int status, const std::string& body, const char* mime = "application/json", const std::string& extra = {})
 {
-    mg_printf(conn, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", status,
-              mg_get_response_code_text(conn, status), mime, body.size());
+    mg_printf(conn, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n%sConnection: close\r\n\r\n", status,
+              mg_get_response_code_text(conn, status), mime, body.size(), extra.c_str());
     mg_write(conn, body.data(), body.size());
 }
 
-void replyJson(mg_connection* conn, int status, const json& value)
+void replyJson(mg_connection* conn, int status, const json& value, const std::string& extra = {})
 {
-    reply(conn, status, value.dump(-1, ' ', false, json::error_handler_t::replace));
+    reply(conn, status, value.dump(-1, ' ', false, json::error_handler_t::replace), "application/json", extra);
+}
+
+/// 对话补全的响应头带上同时能算几个请求：Friday 的请求闸门照它定这个本地引擎的并发（llm 0.2 起按显存定，见 llm-protocol.md §3）
+std::string parallelHeader(int parallel)
+{
+    return parallel > 0 ? "X-Friday-Parallel: " + std::to_string(parallel) + "\r\n" : std::string();
 }
 
 void replyError(mg_connection* conn, int status, const std::string& message, const char* type = "invalid_request_error")
@@ -140,6 +147,8 @@ struct StreamWriter {
     mg_connection* conn = nullptr;
     bool streaming = false;
     bool headersSent = false;
+    /// X-Friday-Parallel
+    std::string extraHeaders;
     bool broken = false;
     int64_t lastWrite = 0;
     int64_t started = 0;
@@ -151,7 +160,8 @@ struct StreamWriter {
         headersSent = true;
         mg_printf(conn,
                   "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n"
-                  "Connection: close\r\nX-Accel-Buffering: no\r\n\r\n");
+                  "%sConnection: close\r\nX-Accel-Buffering: no\r\n\r\n",
+                  extraHeaders.c_str());
         lastWrite = nowMs();
         return true;
     }
@@ -464,13 +474,14 @@ int Server::handleChat(mg_connection* conn)
     writer.conn = conn;
     writer.streaming = body.contains("stream") && body["stream"].is_boolean() && body["stream"].get<bool>();
     writer.started = nowMs();
+    writer.extraHeaders = parallelHeader(runtime->parallel());
     json result;
     const int status = runtime->chat(std::move(body), &StreamWriter::onChunk, &StreamWriter::shouldStop, &writer, result);
     if (!writer.streaming) {
         if (status == FLR_OK)
-            replyJson(conn, 200, result);
+            replyJson(conn, 200, result, writer.extraHeaders);
         else if (status != FLR_CANCELLED)
-            replyJson(conn, httpStatus(status), errorBody(result, status));
+            replyJson(conn, httpStatus(status), errorBody(result, status), writer.extraHeaders);
         return status == FLR_OK ? 200 : httpStatus(status);
     }
     if (status == FLR_OK) {
@@ -480,7 +491,7 @@ int Server::handleChat(mg_connection* conn)
         writer.write("data: [DONE]\n\n");
     } else if (!writer.headersSent) {
         if (status != FLR_CANCELLED)
-            replyJson(conn, httpStatus(status), errorBody(result, status));
+            replyJson(conn, httpStatus(status), errorBody(result, status), writer.extraHeaders);
         return httpStatus(status);
     } else if (status != FLR_CANCELLED) {
         writer.write("data: " + errorBody(result, status).dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");

@@ -7,7 +7,7 @@
 #   cmake -B build -G Ninja -DLLM_CUDA=ON          # 或 -DLLM_VULKAN=ON / -DLLM_METAL=ON
 #   cmake --build build                             # 产物 build/bin/friday-llm
 cmake_minimum_required(VERSION 3.24)
-project(friday-llm VERSION 0.1.2 LANGUAGES C CXX)
+project(friday-llm VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

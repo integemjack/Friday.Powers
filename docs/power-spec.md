@@ -68,6 +68,19 @@ Windows 上的 CUDA 版不能把 cuBLAS 静态链进去（NVIDIA 只给 DLL）�
 schema 2 的清单多两个字段：`library`（`{format: "gguf", kinds: ["text","multimodal"] | ["image","video"]}`：模型在模型库里选）、
 `families`（diffusion 的模型家族，见 [diffusion-protocol.md](diffusion-protocol.md) §1）。
 
+可选的 `options`（Friday 2.8 起认）：用户能在 Friday 的「设置 › 能力」里选的设置。Friday 按它画选择框（本机、看着远程机器时都能改），
+记下选的值，拉起进程时放进 `env` 那个环境变量；改了以后这个 Power 重新启动才生效。旧版 Friday 不认这个字段，照旧不设环境变量，
+所以 Power 不设环境变量时要按 `default` 的意思办。
+
+```json
+"options": [{
+  "key": "parallel", "title": "同时处理的请求", "detail": "……", "env": "FRIDAY_LLM_PARALLEL", "default": 0,
+  "choices": [{ "value": 0, "title": "自动（按显存）" }, { "value": 8, "title": "8 个" }]
+}]
+```
+
+只认 `choices` 里列的值（数、字符串都行，环境变量里整数不带小数点）。选回 `default` 时 Friday 不再记它。
+
 ## 2. 和 Friday 的约定（宿主协议）
 
 启动：

@@ -33,11 +33,11 @@ struct LoadOptions {
     std::string mmprojPath;
     /// chunk 的 model 字段（Friday 的模型 id）
     std::string modelId;
-    /// 同时在算的请求最多几个
-    int parallel = 4;
-    /// 缓存着的序列数（0 = 自动：纯注意力 32；混合 / 循环 / 滑窗 parallel + 4）
+    /// 同时在算的请求最多几个（0 = 按显存定，见 Capacity.h）
+    int parallel = 0;
+    /// 缓存着的序列数（0 = 自动：纯注意力 32（至少 parallel + 8）；混合 / 循环 / 滑窗 parallel + 4）
     int sequences = 0;
-    /// KV 池（-c；0 = 模型的训练上下文，fit 按显存往下调）
+    /// KV 池（-c；0 = 按显存定：放得下训练上下文时按剩下的显存放大，放不下时 fit 往下调）
     int contextTokens = 0;
     /// 单个序列最多占多少（--kv-unified-per-slot；0 = 不另限，最多整个池子）
     int perSequence = 0;
@@ -67,6 +67,8 @@ public:
     const std::string& modelPath() const { return m_modelPath; }
     const std::string& mmprojPath() const { return m_mmprojPath; }
     const std::string& modelId() const { return m_modelId; }
+    /// 同时在算的请求最多几个（Friday 的请求闸门照它定并发）
+    int parallel() const { return m_nParallel; }
 
     // MARK: SequenceHost（StateFile 的 seqSave… 用）
     int appSequences() const override { return m_nSeq; }
@@ -105,6 +107,8 @@ private:
     int m_nSeq = 1;
     int m_nSeqMax = 2;
     int m_nParallel = 1;
+    /// 按显存定容量的说明（/v1/info）
+    std::string m_capacity;
     int m_nBatch = 0;
     int m_nUbatch = 0;
     uint64_t m_kvBytesPerToken = 0;

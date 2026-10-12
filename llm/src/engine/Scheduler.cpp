@@ -3,6 +3,7 @@
 // （MIT License，Copyright (c) 2023-2026 The ggml authors）；v2.7 加基数树前缀共享（docs/llm-design.md §3）。
 #include "Scheduler.h"
 
+#include "Capacity.h"
 #include "RadixTree.h"
 #include "RuntimeLog.h"
 
@@ -14,6 +15,7 @@
 #include <future>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <thread>
 
 namespace flr {
@@ -61,6 +63,13 @@ struct Request {
     int seq = -1;
     /// 在等另一个正在预填的请求算过共用的前缀（只记一次统计）
     bool deferred = false;
+    /// 在等 KV 池腾出地方（只记一次日志）
+    bool kvWaiting = false;
+    /// 提示占的 KV 格子（媒体块按 n_tokens 算）与媒体块多出来的格子（下标，n_tokens − 1），算「从第几项起还要多少格」用
+    int64_t promptCells = 0;
+    std::vector<std::pair<size_t, int>> mediaExtra;
+    /// 给生成留的格子（generationReserve）
+    int reserve = 0;
     /// 已进 KV 的提示项数
     int nDone = 0;
     /// 这一步加进批的项数
@@ -83,6 +92,18 @@ struct Request {
     /// 日志：生成阶段 llama_process 与采样各用了多少（微秒）
     int64_t decodeUs = 0;
     int64_t sampleUs = 0;
+
+    /// 提示从第 from 项起占多少 KV 格子
+    int64_t cellsFrom(size_t from) const
+    {
+        const size_t total = chat.prepared.items.size();
+        int64_t cells = from < total ? int64_t(total - from) : 0;
+        for (const auto& [index, extra] : mediaExtra) {
+            if (index >= from)
+                cells += extra;
+        }
+        return cells;
+    }
 
     void push(StreamEvent event)
     {
@@ -276,6 +297,7 @@ struct Scheduler::Impl {
     uint64_t tokensShared = 0;
     uint64_t tokensPrefilled = 0;
     uint64_t evictions = 0;
+    uint64_t kvWaits = 0;
 
     // —— abort 回调看的：这一批里有哪些请求 ——
     std::vector<Request*> inBatch;
@@ -539,6 +561,35 @@ struct Scheduler::Impl {
         return placement;
     }
 
+    // MARK: KV 余量
+
+    /// 在算的请求已经占的格子（共用的只算一次）+ 它们还要的（没预填完的提示 + 给生成留的还没用掉的）
+    int64_t committedCells() const
+    {
+        std::set<int> seqs;
+        int64_t still = 0;
+        for (const std::shared_ptr<Request>& request : active) {
+            if (request->phase == Request::Phase::Done || request->seq < 0)
+                continue;
+            seqs.insert(request->seq);
+            still += request->cellsFrom(size_t(std::max(0, request->nDone)));
+            still += std::max<int64_t>(0, int64_t(request->reserve) - int64_t(request->stats.generated));
+        }
+        return int64_t(tree.cells(seqs)) + still;
+    }
+
+    /// 放进这个请求还要多少格子：和在算的请求共用的前缀已经算在 committedCells 里；从空闲序列接着用、分叉的那段要算（从此被占住）
+    int64_t neededCells(const Request& request) const
+    {
+        std::set<int> idle;
+        for (int seq = 0; seq < config.nSeq; ++seq) {
+            if (!busy[size_t(seq)])
+                idle.insert(seq);
+        }
+        const RadixTree::Match shared = tree.match(request.chat.prepared.items, idle);
+        return request.cellsFrom(shared.length) + request.reserve;
+    }
+
     // MARK: 排队与开始
 
     /// 返回 true = 有进展（开始了请求、执行了活或撤下了取消的请求）
@@ -623,6 +674,20 @@ struct Scheduler::Impl {
             }
             if (placement.seq < 0)
                 continue;
+            // KV 余量放行：放不下就和后面的一起等（按优先级排队，不让小请求一直插到前面）。没有在算的请求时总放一个
+            if (runningNow > 0 && config.nCtx > 0) {
+                const int64_t need = neededCells(*request);
+                const int64_t committed = committedCells();
+                if (committed + need > int64_t(config.nCtx) * 95 / 100) {
+                    if (!request->kvWaiting) {
+                        request->kvWaiting = true;
+                        ++kvWaits;
+                        logf(FLR_LOG_NOTICE, "请求 #%llu 等 KV 池腾地方：要 %lld 格，在算的 %d 个已占 / 预留 %lld 格，池子 %d 格",
+                             (unsigned long long) request->serial, (long long) need, runningNow, (long long) committed, config.nCtx);
+                    }
+                    break;
+                }
+            }
             taken[size_t(placement.seq)] = 1;
             startRequest(request, placement);
             started.push_back(request);
@@ -1278,6 +1343,8 @@ struct Scheduler::Impl {
             { "forks", forks },
             { "dedupe_waits", dedupeWaits },
             { "evictions", evictions },
+            { "kv_waits", kvWaits },
+            { "kv", json { { "cells", config.nCtx }, { "used", tree.cells }, { "committed", committedCells() } } },
             { "tokens_reused", tokensReused },
             { "tokens_shared", tokensShared },
             { "tokens_prefilled", tokensPrefilled },
@@ -1369,6 +1436,15 @@ int Scheduler::chat(ChatRequest request, Sampler sampler, flr_chunk_fn chunk, fl
     pending->chat = std::move(request);
     pending->sampler.emplace(std::move(sampler));
     pending->tSubmit = ggml_time_us();
+    {
+        const std::vector<LedgerItem>& items = pending->chat.prepared.items;
+        for (size_t i = 0; i < items.size(); ++i) {
+            if (items[i].n_tokens > 1)
+                pending->mediaExtra.emplace_back(i, items[i].n_tokens - 1);
+        }
+        pending->promptCells = pending->cellsFrom(0);
+        pending->reserve = generationReserve(pending->chat.prepared.n_predict, pending->promptCells, d->config.nCtxSeq);
+    }
     // 推理线程用不到解析器：整个交给这边的 ChatStream
     ChatStream stream(std::move(pending->chat.chatSession), "chatcmpl-" + ChatStream::randomId(), d->config.modelName);
     const bool streaming = pending->chat.stream;

@@ -49,6 +49,8 @@ public:
     size_t exclusive(int seq) const;
     /// seq 的账本有多少项与别的序列共用（= 账本长度 − exclusive）
     size_t sharedWithOthers(int seq) const;
+    /// 这些序列的账本合起来占多少 KV 格子（共用的只算一次；媒体块按 n_tokens 算）
+    size_t cells(const std::set<int>& seqs) const;
 
     struct Stats {
         size_t nodes = 0;
@@ -57,6 +59,8 @@ public:
         size_t items = 0;
         /// 所有序列账本的总项数（不共用时要占的）
         size_t logical = 0;
+        /// 树里的 KV 格子数（== items，只是媒体块按 n_tokens 算）
+        size_t cells = 0;
     };
     Stats stats() const;
 

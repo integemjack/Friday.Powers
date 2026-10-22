@@ -26,6 +26,10 @@
 #ifdef VOICE_HAS_TTS
 #include "Synthesizer.h"
 #include "TextSplitter.h"
+#include "cosyvoice.h"
+#endif
+#ifdef VOICE_HAS_CLONE
+#include "VoiceCloner.h"
 #endif
 
 #include "json.hpp"
@@ -67,9 +71,10 @@ struct Options {
     std::string command;
     std::string models, model, vad, device = "auto", host = "127.0.0.1", token, language = "auto", input;
     std::string ttsModel, voices, text, output, voice, instruction, speakerModel, features, whisperModel, prompt;
+    std::string userVoices, cloneTokenizer, cloneCampplus;
     float speed = 1.0f;
     int port = 0, threads = 0, repeat = 1, chunkTokens = 0;
-    bool parentStdin = false, itn = true, verbose = false, tts = true, speaker = true, whisper = true;
+    bool parentStdin = false, itn = true, verbose = false, tts = true, speaker = true, whisper = true, clone = true;
     std::vector<std::string> inputs;
 };
 
@@ -81,9 +86,12 @@ void usage()
                  "                          [--host 127.0.0.1] [--port 0] [--device auto|cpu|cuda[:N]|vulkan[:N]|metal|opencl]\n"
                  "                          [--token T] [--threads N] [--parent-stdin] [--verbose]\n"
                  "                          [--tts-model COSYVOICE3.gguf --voices DIR | --no-tts]\n"
+                 "                          [--user-voices DIR]（用户克隆音色的目录，默认 <models>/user-voices；--no-clone 关掉克隆）\n"
                  "                          [--speaker-model CAMPPLUS.onnx | --no-speaker]（声纹：每句话 final 带上说话人特征）\n"
                  "                          [--whisper-model GGML-WHISPER.bin | --no-whisper]（定稿用 Whisper：中英混说准）\n"
                  "  friday-voice transcribe (模型参数同上) [--language auto|zh|en|yue|ja|ko] [--no-itn] [--prompt 热词] [--repeat N] AUDIO\n"
+                 "  friday-voice clone      (--models DIR) --reference AUDIO [--voice 名] [--text 底稿] [--output OUT.gguf]\n"
+                 "                          把一段 8~15 秒的录音提成本地音色（没给 text 就自动听写当底稿）（v0.5）\n"
                  "  friday-voice speak      (--models DIR | --tts-model COSYVOICE3.gguf --voices DIR) --text TEXT --output OUT.wav\n"
                  "                          [--voice NAME] [--speed 1.0] [--instruction TEXT] [--repeat N]\n"
                  "  friday-voice speaker    (--models DIR | --speaker-model CAMPPLUS.onnx) AUDIO [AUDIO2 …]\n"
@@ -158,6 +166,13 @@ bool parse(int argc, char** argv, Options& o)
             if (!next(o.whisperModel)) return false;
         } else if (a == "--no-whisper") {
             o.whisper = false;
+        } else if (a == "--reference") {
+            if (!next(o.input)) return false;
+            o.inputs.push_back(o.input);
+        } else if (a == "--user-voices") {
+            if (!next(o.userVoices)) return false;
+        } else if (a == "--no-clone") {
+            o.clone = false;
         } else if (a == "--prompt") {
             if (!next(o.prompt)) return false;
         } else if (a == "--features") {
@@ -257,18 +272,44 @@ bool resolveModels(Options& o, std::string* error)
         }
         // 声纹：CosyVoice 模型目录里的 campplus.onnx
         if (o.speakerModel.empty()) {
-            for (const fs::path& candidate : { dir / "campplus.onnx", dir / "cosyvoice3" / "campplus.onnx" }) {
+            for (const fs::path& candidate : { dir / "campplus.onnx", dir / "cosyvoice3" / "campplus.onnx", dir / "frontend-onnx" / "campplus.onnx" }) {
                 if (fs::exists(candidate)) {
                     o.speakerModel = candidate.u8string();
                     break;
                 }
             }
         }
+        // v0.5 克隆前端：speech tokenizer（int8 优先）+ campplus；用户音色默认放 <models>/user-voices
+        if (o.cloneTokenizer.empty()) {
+            for (const fs::path& candidate : { dir / "frontend-onnx" / "speech_tokenizer_v3.int8.onnx", dir / "frontend-onnx" / "speech_tokenizer_v3.onnx",
+                                              dir / "speech_tokenizer_v3.int8.onnx" }) {
+                if (fs::exists(candidate)) {
+                    o.cloneTokenizer = candidate.u8string();
+                    break;
+                }
+            }
+        }
+        if (o.cloneCampplus.empty()) {
+            for (const fs::path& candidate : { dir / "frontend-onnx" / "campplus.onnx", dir / "campplus.onnx", dir / "cosyvoice3" / "campplus.onnx" }) {
+                if (fs::exists(candidate)) {
+                    o.cloneCampplus = candidate.u8string();
+                    break;
+                }
+            }
+        }
+        // 目录不存在也设：第一次克隆时才建（Synthesizer 扫描会跳过不存在的）
+        if (o.userVoices.empty() && !o.models.empty())
+            o.userVoices = (dir / "user-voices").u8string();
     }
     if (!o.speaker)
         o.speakerModel.clear();
     if (!o.whisper)
         o.whisperModel.clear();
+    if (!o.clone || o.cloneTokenizer.empty() || o.cloneCampplus.empty()) {
+        o.cloneTokenizer.clear();
+        o.cloneCampplus.clear();
+        o.clone = false;
+    }
     // 默认音色随包发，在可执行文件旁边的 voices/
     if (o.voices.empty()) {
         const fs::path beside = executableDir() / "voices";
@@ -281,6 +322,14 @@ bool resolveModels(Options& o, std::string* error)
         if (o.speakerModel.empty() && error)
             *error = "要给声纹模型：--models <目录> 或 --speaker-model campplus.onnx";
         return !o.speakerModel.empty();
+    }
+    if (o.command == "clone") {
+        if (o.cloneTokenizer.empty() || o.cloneCampplus.empty()) {
+            if (error)
+                *error = "要给克隆前端模型：--models <目录>（里面要有 frontend-onnx/speech_tokenizer_v3.int8.onnx 和 campplus.onnx）";
+            return false;
+        }
+        return true;
     }
     if (o.model.empty() || o.vad.empty()) {
         if (error)
@@ -331,7 +380,7 @@ int runSpeak(const Options& o, const voice::Backend& backend)
     }
     voice::Synthesizer synth(backend);
     std::string error;
-    if (!synth.load(o.ttsModel, o.voices, &error)) {
+    if (!synth.load(o.ttsModel, o.voices, &error, o.userVoices)) {
         VLOG_ERROR("%s", error.c_str());
         return 3;
     }
@@ -424,6 +473,76 @@ int runSpeaker(const Options& o, voice::Backend& backend)
     return 0;
 }
 
+/// friday-voice clone：一段参考录音 → 本地音色 gguf（打印 JSON：voice/transcript/file/seconds）
+#ifdef VOICE_HAS_CLONE
+int runClone(const Options& o, voice::SenseVoice& recognizer, voice::FsmnVad& vad, voice::Whisper* whisper)
+{
+    if (o.input.empty()) {
+        usage();
+        return 2;
+    }
+    // 16 kHz 认语音 token、听写底稿；24 kHz 给说话人向量和 mel（从原文件直接解，别从 16 kHz 升）
+    std::vector<float> pcm, pcm24;
+    std::string error;
+    if (!voice::decodeAudioFile(o.input, pcm, &error) || !voice::decodeAudioFile(o.input, pcm24, &error, 24000)) {
+        VLOG_ERROR("%s", error.c_str());
+        return 4;
+    }
+    double seconds = pcm.size() / double(voice::kSampleRate);
+    if (seconds < 3.0) {
+        VLOG_ERROR("录音太短（至少 3 秒，建议 8~15 秒）");
+        return 4;
+    }
+    if (seconds > 30.0) {
+        pcm.resize(size_t(30.0 * voice::kSampleRate));
+        pcm24.resize(size_t(30.0 * 24000));
+        seconds = 30.0;
+    }
+    std::string text = o.text;
+    if (text.empty()) {
+        voice::Fbank fbank;
+        voice::StreamConfig config;
+        config.language = o.language;
+        config.endSilenceMs = 600;
+        std::string language;
+        text = voice::transcribeWhole(recognizer, vad, fbank, pcm, config, &language, &error, whisper);
+        if (!text.empty() && error.empty()) {
+            VLOG_INFO("克隆底稿（%s，自动听写）：%s", language.c_str(), text.c_str());
+        }
+    }
+    if (text.empty()) {
+        VLOG_ERROR("没有底稿（--text 没给，自动听写也没听出话）");
+        return 5;
+    }
+    voice::VoiceCloner cloner;
+    cloner.configure(o.cloneTokenizer, o.cloneCampplus);
+    const std::string name = o.voice.empty() ? "my-voice" : o.voice;
+    fs::path out;
+    if (!o.output.empty()) {
+        out = fs::u8path(o.output);
+    } else {
+        const fs::path dir = fs::u8path(o.userVoices.empty() ? o.models + "/user-voices" : o.userVoices);
+        out = dir / fs::u8path(name + ".gguf");
+    }
+    cosyvoice_prompt_speech_t speech = cloner.clone(pcm.data(), pcm.size(), pcm24.data(), pcm24.size(), text, &error);
+    if (!speech) {
+        VLOG_ERROR("%s", error.c_str());
+        return 5;
+    }
+    std::error_code ec;
+    fs::create_directories(out.parent_path(), ec);
+    const bool saved = cosyvoice_prompt_speech_save_to_file(speech, out.u8string().c_str());
+    cosyvoice_prompt_speech_free(speech);
+    if (!saved) {
+        VLOG_ERROR("写不了音色文件：%s", out.u8string().c_str());
+        return 5;
+    }
+    std::printf("%s\n", json { { "voice", name }, { "transcript", text }, { "file", out.u8string() }, { "seconds", seconds } }.dump().c_str());
+    std::fflush(stdout);
+    return 0;
+}
+#endif
+
 std::atomic<bool> g_stop { false };
 std::mutex g_stopMutex;
 std::condition_variable g_stopWake;
@@ -498,7 +617,7 @@ int main(int argc, char** argv)
         std::fflush(stdout);
         return 0;
     }
-    if (o.command != "serve" && o.command != "transcribe" && o.command != "speak" && o.command != "speaker") {
+    if (o.command != "serve" && o.command != "transcribe" && o.command != "speak" && o.command != "speaker" && o.command != "clone") {
         usage();
         return 2;
     }
@@ -572,15 +691,38 @@ int main(int argc, char** argv)
         return 0;
     }
 
+#ifdef VOICE_HAS_CLONE
+    if (o.command == "clone")
+        return runClone(o, recognizer, vad, whisper.get());
+#else
+    if (o.command == "clone") {
+        VLOG_ERROR("这个版本没带克隆（编的时候没有 ONNX Runtime）");
+        return 2;
+    }
+#endif
+
     // serve
     voice::Synthesizer* synthesizer = nullptr;
+    voice::VoiceCloner* clonerPtr = nullptr;
 #ifdef VOICE_HAS_TTS
     std::unique_ptr<voice::Synthesizer> synth;
+#ifdef VOICE_HAS_CLONE
+    std::unique_ptr<voice::VoiceCloner> cloner;
+#endif
     if (o.tts && !o.ttsModel.empty() && !o.voices.empty()) {
         synth = std::make_unique<voice::Synthesizer>(backend);
-        if (synth->load(o.ttsModel, o.voices, &error)) {
+        // v0.5 用户音色（克隆的、导入的）一起加载；导入不用克隆模型，所以 --no-clone 也照样加载
+        if (synth->load(o.ttsModel, o.voices, &error, o.userVoices)) {
             synth->setChunkTokens(unsigned(std::max(0, o.chunkTokens)));
             synthesizer = synth.get();
+#ifdef VOICE_HAS_CLONE
+            // 克隆：前端模型在才有；会话惰性加载，第一次克隆才占内存
+            if (o.clone && !o.userVoices.empty()) {
+                cloner = std::make_unique<voice::VoiceCloner>();
+                cloner->configure(o.cloneTokenizer, o.cloneCampplus);
+                clonerPtr = cloner.get();
+            }
+#endif
         } else {
             VLOG_WARN("合成用不了，只开听写：%s", error.c_str());
             synth.reset();
@@ -601,7 +743,8 @@ int main(int argc, char** argv)
     options.host = o.host;
     options.port = o.port;
     options.token = o.token;
-    voice::Server server(backend, recognizer, vad, synthesizer, options, voiceprint.get(), whisper.get());
+    voice::Server server(backend, recognizer, vad, synthesizer, options, voiceprint.get(), whisper.get(), clonerPtr,
+                              synthesizer ? o.userVoices : std::string());
     if (!server.start(&error)) {
         VLOG_ERROR("%s", error.c_str());
         return 6;

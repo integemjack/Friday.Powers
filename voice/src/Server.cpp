@@ -9,6 +9,10 @@
 #include "Speaker.h"
 #include "Synthesizer.h"
 #include "TextSplitter.h"
+#include "cosyvoice.h"
+#endif
+#ifdef VOICE_HAS_CLONE
+#include "VoiceCloner.h"
 #endif
 
 #include "civetweb.h"
@@ -18,6 +22,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <mutex>
 
@@ -89,6 +95,29 @@ void replyError(mg_connection* conn, int status, const std::string& message)
     reply(conn, status, json { { "error", { { "message", message }, { "type", "invalid_request_error" } } } }.dump());
 }
 
+/// multipart/form-data 的各个字段（文件字段也整个读进内存：录音、音色都只有几百 KB）
+bool readForm(mg_connection* conn, std::map<std::string, std::string>& fields)
+{
+    struct Form {
+        std::map<std::string, std::string>* fields;
+        std::string current;
+    } form { &fields, {} };
+    mg_form_data_handler handler {};
+    handler.field_found = [](const char* key, const char*, char*, size_t, void* user) -> int {
+        static_cast<Form*>(user)->current = key ? key : "";
+        return MG_FORM_FIELD_STORAGE_GET;
+    };
+    handler.field_get = [](const char* key, const char* value, size_t size, void* user) -> int {
+        auto& f = *static_cast<Form*>(user);
+        const std::string name = key && *key ? std::string(key) : f.current;
+        if (value && !name.empty())
+            (*f.fields)[name].append(value, size);
+        return MG_FORM_FIELD_HANDLE_GET;
+    };
+    handler.user_data = &form;
+    return mg_handle_form_request(conn, &handler) >= 0;
+}
+
 int findFreePort(const std::string& host)
 {
     int port = 0;
@@ -117,6 +146,15 @@ int modelsHandler(mg_connection* conn, void* data) { return static_cast<Server*>
 int transcriptionsHandler(mg_connection* conn, void* data) { return static_cast<Server*>(data)->handleTranscriptions(conn); }
 int speechHandler(mg_connection* conn, void* data) { return static_cast<Server*>(data)->handleSpeech(conn); }
 int speakerHandler(mg_connection* conn, void* data) { return static_cast<Server*>(data)->handleSpeaker(conn); }
+int voicesHandler(mg_connection* conn, void* data) { return static_cast<Server*>(data)->handleVoices(conn); }
+/// /v1/voice/clone、/v1/voice/import（POST），/v1/voice/<名字>（DELETE）
+int voiceHandler(mg_connection* conn, void* data)
+{
+    const mg_request_info* info = mg_get_request_info(conn);
+    std::string rest = info && info->local_uri_raw ? info->local_uri_raw : "";   // 没解码的：名字里的 %xx 在 handleVoice 里解一次
+    rest = rest.size() > 10 && rest.compare(0, 10, "/v1/voice/") == 0 ? rest.substr(10) : std::string();
+    return static_cast<Server*>(data)->handleVoice(conn, rest);
+}
 int socketConnect(const mg_connection* conn, void* data) { return static_cast<Server*>(data)->authorized(conn) ? 0 : 1; }
 void socketReady(mg_connection* conn, void* data) { static_cast<Server*>(data)->onSocketReady(conn); }
 void speakSocketReady(mg_connection* conn, void* data) { static_cast<Server*>(data)->onSpeakSocketReady(conn); }
@@ -135,9 +173,9 @@ int logMessage(const mg_connection*, const char* message)
 } // namespace
 
 Server::Server(Backend& backend, SenseVoice& recognizer, FsmnVad& vad, Synthesizer* synthesizer, const ServerOptions& options,
-               SpeakerEncoder* voiceprint, Whisper* whisper)
+               SpeakerEncoder* voiceprint, Whisper* whisper, VoiceCloner* cloner, const std::string& userVoicesDir)
     : m_backend(backend), m_recognizer(recognizer), m_vad(vad), m_synth(synthesizer), m_voiceprint(voiceprint), m_whisper(whisper),
-      m_options(options)
+      m_cloner(cloner), m_userVoicesDir(userVoicesDir), m_options(options)
 {
 }
 
@@ -185,6 +223,11 @@ bool Server::start(std::string* error)
     if (m_synth) {
         mg_set_request_handler(m_ctx, "/v1/audio/speech", speechHandler, this);
         mg_set_websocket_handler(m_ctx, "/v1/realtime/speak", socketConnect, speakSocketReady, socketData, socketClose, this);
+        // v0.5 用户音色：导入、删除要合成 + 用户音色目录；克隆还要克隆前端（handleVoice 里看）
+        if (!m_userVoicesDir.empty()) {
+            mg_set_request_handler(m_ctx, "/v1/voices", voicesHandler, this);
+            mg_set_request_handler(m_ctx, "/v1/voice", voiceHandler, this);
+        }
     }
     return true;
 }
@@ -248,6 +291,13 @@ int Server::handleInfo(mg_connection* conn)
         models["tts"] = m_synth->path();
         models["tts_sample_rate"] = m_synth->sampleRate();
         models["voices"] = m_synth->voices();
+        // v0.5 用户音色（克隆的、导入的）
+        if (!m_userVoicesDir.empty()) {
+            capabilities.push_back("voiceImport");
+            models["user_voices"] = m_synth->userVoices();
+        }
+        if (cloneAvailable())
+            capabilities.push_back("voiceCloning");
     }
 #endif
     const json info {
@@ -290,30 +340,14 @@ int Server::handleSpeaker(mg_connection* conn)
         replyError(conn, 405, "use POST multipart/form-data");
         return 405;
     }
-    struct Form {
-        std::map<std::string, std::string> fields;
-        std::string current;
-    } form;
-    mg_form_data_handler handler {};
-    handler.field_found = [](const char* key, const char*, char*, size_t, void* user) -> int {
-        static_cast<Form*>(user)->current = key ? key : "";
-        return MG_FORM_FIELD_STORAGE_GET;
-    };
-    handler.field_get = [](const char* key, const char* value, size_t size, void* user) -> int {
-        auto& f = *static_cast<Form*>(user);
-        const std::string name = key && *key ? std::string(key) : f.current;
-        if (value && !name.empty())
-            f.fields[name].append(value, size);
-        return MG_FORM_FIELD_HANDLE_GET;
-    };
-    handler.user_data = &form;
-    if (mg_handle_form_request(conn, &handler) < 0 || form.fields["file"].empty()) {
+    std::map<std::string, std::string> fields;
+    if (!readForm(conn, fields) || fields["file"].empty()) {
         replyError(conn, 400, "missing multipart field 'file'");
         return 400;
     }
     std::vector<float> pcm;
     std::string error;
-    if (!decodeAudio(form.fields["file"].data(), form.fields["file"].size(), pcm, &error)) {
+    if (!decodeAudio(fields["file"].data(), fields["file"].size(), pcm, &error)) {
         replyError(conn, 400, error);
         return 400;
     }
@@ -325,6 +359,192 @@ int Server::handleSpeaker(mg_connection* conn)
     VLOG_INFO("声纹：%.1f 秒录音，用时 %.3f 秒", e.audioSeconds, e.seconds);
     reply(conn, 200, json { { "embedding", e.vector }, { "dim", e.vector.size() }, { "duration", pcm.size() / double(kSampleRate) } }.dump());
     return 200;
+}
+
+// ── v0.5 用户音色：克隆（参考录音 + 底稿 → prompt_speech）、导入（别处克隆好的 .gguf）、删除；都热生效，存在 <models>/user-voices ──
+
+bool Server::cloneAvailable() const
+{
+#ifdef VOICE_HAS_CLONE
+    return m_synth && m_cloner && m_cloner->available() && !m_userVoicesDir.empty();
+#else
+    return false;
+#endif
+}
+
+namespace {
+
+/// 音色名：1–40 个字，不要路径分隔符、控制字符和文件名里不能有的，不以点、空白开头结尾（文件名就是它）
+bool validVoiceName(const std::string& name)
+{
+    if (name.empty() || name.size() > 120 || name[0] == '.' || name[0] == ' ' || name.back() == ' ' || name.back() == '.')
+        return false;
+    size_t chars = 0;
+    for (const unsigned char c : name) {
+        if ((c & 0xC0) != 0x80)
+            ++chars;
+        if (c < 0x20 || c == 0x7F || std::strchr("\\/:*?\"<>|", c))
+            return false;
+    }
+    return chars <= 40;
+}
+
+} // namespace
+
+int Server::handleVoices(mg_connection* conn)
+{
+    if (!authorized(conn)) {
+        replyError(conn, 401, "unauthorized");
+        return 401;
+    }
+#ifdef VOICE_HAS_TTS
+    if (m_synth) {
+        reply(conn, 200, json { { "voices", m_synth->voices() }, { "user_voices", m_synth->userVoices() }, { "default", m_synth->defaultVoice() },
+                                { "clone", cloneAvailable() } }.dump());
+        return 200;
+    }
+#endif
+    replyError(conn, 404, "没有合成模型");
+    return 404;
+}
+
+int Server::handleVoice(mg_connection* conn, const std::string& rest)
+{
+    if (!authorized(conn)) {
+        replyError(conn, 401, "unauthorized");
+        return 401;
+    }
+#ifndef VOICE_HAS_TTS
+    (void)rest;
+    replyError(conn, 404, "这个版本没编合成");
+    return 404;
+#else
+    if (!m_synth) {
+        replyError(conn, 404, "没有合成模型");
+        return 404;
+    }
+    const mg_request_info* info = mg_get_request_info(conn);
+    const std::string method = info && info->request_method ? info->request_method : "";
+    if (method == "DELETE") {
+        std::string name(rest.size(), '\0');
+        name.resize(size_t(std::max(0, mg_url_decode(rest.c_str(), int(rest.size()), name.data(), int(name.size()) + 1, 0))));
+        std::string error;
+        if (!m_synth->removeVoice(name, &error)) {
+            const int status = m_synth->hasVoice(name) ? 403 : 404;
+            replyError(conn, status, error);
+            return status;
+        }
+        reply(conn, 200, json { { "deleted", name } }.dump());
+        return 200;
+    }
+    if (method != "POST" || (rest != "clone" && rest != "import")) {
+        replyError(conn, 405, "POST /v1/voice/clone、POST /v1/voice/import、DELETE /v1/voice/<名字>");
+        return 405;
+    }
+    if (rest == "clone" && !cloneAvailable()) {
+        replyError(conn, 501, "这台的本地语音不能克隆（克隆模型没下载，或者这个包没带克隆）");
+        return 501;
+    }
+    std::map<std::string, std::string> fields;
+    if (!readForm(conn, fields) || fields["file"].empty()) {
+        replyError(conn, 400, "missing multipart field 'file'");
+        return 400;
+    }
+    const std::string name = fields["name"];
+    const bool replace = fields["replace"] == "true" || fields["replace"] == "1";
+    if (!validVoiceName(name)) {
+        replyError(conn, 400, "音色名要 1–40 个字，不能有 \\ / : * ? \" < > | 这些符号");
+        return 400;
+    }
+    if (m_synth->hasVoice(name) && (!replace || !m_synth->isUserVoice(name))) {
+        replyError(conn, 409, m_synth->isUserVoice(name) ? "已经有叫「" + name + "」的音色了" : "「" + name + "」是内置音色的名字，换一个");
+        return 409;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    std::string error;
+    json result { { "voice", name } };
+    // 先写成临时文件（点开头，启动时扫描跳过），注册成功再改名成 <名字>.gguf
+    namespace fs = std::filesystem;
+    static std::atomic<unsigned> sequence { 0 };
+    const fs::path dir = fs::u8path(m_userVoicesDir);
+    const fs::path temp = dir / (".pending-" + std::to_string(++sequence) + ".gguf");
+    const fs::path target = dir / fs::u8path(name + ".gguf");
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    const auto fail = [&](int status, const std::string& message) {
+        std::error_code ignored;
+        fs::remove(temp, ignored);
+        replyError(conn, status, message);
+        return status;
+    };
+    if (rest == "import") {
+        // 别处克隆好的音色（CosyVoice3 的 prompt_speech gguf，比如「克隆声音」工具的音色库）：原样存下，读得出来才收
+        const std::string& data = fields["file"];
+        {
+            std::ofstream out(temp, std::ios::binary);
+            out.write(data.data(), std::streamsize(data.size()));
+            if (!out.good())
+                return fail(500, "写不了音色文件：" + temp.u8string());
+        }
+        if (!Synthesizer::isVoiceFile(temp.u8string()))
+            return fail(400, "不是 CosyVoice3 的音色文件（.gguf），或者文件坏了");
+    } else {
+#ifdef VOICE_HAS_CLONE
+        // 同一段录音解两份：16 kHz 认语音 token、底稿听写；24 kHz 给说话人向量和 mel（别从 16 kHz 升，声音会发闷）
+        const std::string& file = fields["file"];
+        std::vector<float> pcm16, pcm24;
+        if (!decodeAudio(file.data(), file.size(), pcm16, &error) || !decodeAudio(file.data(), file.size(), pcm24, &error, 24000))
+            return fail(400, error);
+        double seconds = pcm16.size() / double(kSampleRate);
+        if (seconds < 3.0)
+            return fail(400, "录音太短（至少 3 秒，最好 8～15 秒）");
+        if (seconds > 30.0) {   // 太长前端慢、像不像也不再涨：只用前 30 秒
+            pcm16.resize(size_t(30.0 * kSampleRate));
+            pcm24.resize(size_t(30.0 * 24000));
+            seconds = 30.0;
+        }
+        // 底稿：没给就听写（SenseVoice + Whisper 定稿，同 /v1/audio/transcriptions）
+        std::string text = fields["text"];
+        if (text.empty()) {
+            StreamConfig config;
+            config.language = fields["language"].empty() ? "auto" : fields["language"];
+            config.endSilenceMs = 600;
+            std::string language;
+            text = transcribeWhole(m_recognizer, m_vad, m_fbank, pcm16, config, &language, &error, m_whisper);
+            if (!error.empty())
+                return fail(500, "听写录音失败：" + error);
+            VLOG_INFO("克隆底稿（%s，自动听写）：%s", language.c_str(), text.c_str());
+            if (text.empty())
+                return fail(400, "录音里没听出说的话");
+        }
+        cosyvoice_prompt_speech_t cloned = m_cloner->clone(pcm16.data(), pcm16.size(), pcm24.data(), pcm24.size(), text, &error);
+        if (!cloned)
+            return fail(400, error);
+        const bool saved = cosyvoice_prompt_speech_save_to_file(cloned, temp.u8string().c_str());
+        cosyvoice_prompt_speech_free(cloned);
+        if (!saved)
+            return fail(500, "写不了音色文件：" + temp.u8string());
+        result["transcript"] = text;
+        result["seconds"] = seconds;
+#endif
+    }
+    cosyvoice_prompt_speech_t speech = cosyvoice_prompt_speech_load_from_file(temp.u8string().c_str());
+    if (!speech)
+        return fail(400, "音色文件读不出来（CRC 不对，或者文件坏了）");
+    if (!m_synth->addUserVoice(name, speech, target.u8string(), replace, &error))   // speech 归它了
+        return fail(400, error);
+    fs::rename(temp, target, ec);
+    if (ec) {
+        std::string ignored;
+        m_synth->removeVoice(name, &ignored);
+        return fail(500, "写不了音色文件：" + target.u8string());
+    }
+    const double took = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    result["took"] = took;
+    VLOG_INFO("用户音色%s：%s，用时 %.1f 秒", rest == "import" ? "导入" : "克隆", name.c_str(), took);
+    reply(conn, 200, result.dump());
+    return 200;
+#endif
 }
 
 int Server::handleTranscriptions(mg_connection* conn)

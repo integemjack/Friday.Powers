@@ -2,7 +2,7 @@
   "schema": 1,
   "id": "voice",
   "title": "本地语音",
-  "detail": "用本机 GPU 实时听写（边说边出字幕，说完一句出带标点的定稿；中英混说的英文词用 Whisper 认）和边写边读（大模型边出字边念，可打断；带五个音色）、声纹（只认登记过的人说的话）；不联网、不花钱。",
+  "detail": "用本机 GPU 实时听写（边说边出字幕，说完一句出带标点的定稿；中英混说的英文词用 Whisper 认）和边写边读（大模型边出字边念，可打断；带五个音色）、声纹（只认登记过的人说的话）、自己的音色（一段 8～15 秒的录音克隆出这个人的声音，或者导入别处克隆好的音色）；不联网、不花钱。",
   "executable": "friday-voice",
   "serve": [
     "serve",
@@ -21,7 +21,9 @@
     "realtimeTranscription",
     "speech",
     "realtimeSpeech",
-    "speakerEmbedding"
+    "speakerEmbedding",
+    "voiceImport",
+    "voiceCloning"
   ],
   "models": [
     {
@@ -75,7 +77,16 @@
       "url": "https://modelscope.cn/models/FunAudioLLM/Fun-CosyVoice3-0.5B-2512/resolve/master/campplus.onnx",
       "sha256": "a6ac6a63997761ae2997373e2ee1c47040854b4b759ea41ec48e4e42df0f4d73",
       "size": 28303423,
-      "purpose": "声纹（CAM++，只认登记过的人说的话）",
+      "purpose": "声纹（CAM++，只认登记过的人说的话；克隆音色时也用它认说话人）",
+      "license": "Apache-2.0"
+    },
+    {
+      "id": "speech-tokenizer-v3-int8",
+      "file": "frontend-onnx/speech_tokenizer_v3.int8.onnx",
+      "url": "https://modelscope.cn/models/Lourdle/Fun-CosyVoice3-0.5B-2512-GGUF/resolve/master/frontend-onnx/speech_tokenizer_v3.int8.onnx",
+      "sha256": "d7caa04fbc2f54af196906469471b607ce2594b7e92ac07dddfb315103a74c72",
+      "size": 244237335,
+      "purpose": "克隆音色（CosyVoice3 的语音分词器，int8；把参考录音提成音色）",
       "license": "Apache-2.0"
     }
   ],
@@ -87,7 +98,8 @@
         "fsmn-vad",
         "whisper-large-v3-turbo-q5",
         "cosyvoice3-q8",
-        "campplus"
+        "campplus",
+        "speech-tokenizer-v3-int8"
       ]
     },
     "windows-x64-cuda13": {
@@ -97,7 +109,8 @@
         "fsmn-vad",
         "whisper-large-v3-turbo-q5",
         "cosyvoice3-q8",
-        "campplus"
+        "campplus",
+        "speech-tokenizer-v3-int8"
       ],
       "runtime": "cuda13"
     },
@@ -108,7 +121,8 @@
         "fsmn-vad",
         "whisper-large-v3-turbo-q5",
         "cosyvoice3-q8",
-        "campplus"
+        "campplus",
+        "speech-tokenizer-v3-int8"
       ]
     },
     "linux-x64-vulkan": {
@@ -118,7 +132,8 @@
         "fsmn-vad",
         "whisper-large-v3-turbo-q5",
         "cosyvoice3-q8",
-        "campplus"
+        "campplus",
+        "speech-tokenizer-v3-int8"
       ]
     },
     "linux-x64-cuda": {
@@ -128,7 +143,8 @@
         "fsmn-vad",
         "whisper-large-v3-turbo-q5",
         "cosyvoice3-q8",
-        "campplus"
+        "campplus",
+        "speech-tokenizer-v3-int8"
       ]
     },
     "linux-arm64-jetson-orin": {
@@ -138,7 +154,8 @@
         "fsmn-vad",
         "whisper-large-v3-turbo-q5",
         "cosyvoice3-q4km",
-        "campplus"
+        "campplus",
+        "speech-tokenizer-v3-int8"
       ]
     },
     "linux-arm64-vulkan": {
@@ -147,7 +164,8 @@
         "sensevoice-small-q8",
         "fsmn-vad",
         "cosyvoice3-q8",
-        "campplus"
+        "campplus",
+        "speech-tokenizer-v3-int8"
       ]
     }
   }

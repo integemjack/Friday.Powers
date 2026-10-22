@@ -105,3 +105,21 @@
 - `POST /v1/audio/speech`（JSON：`input`、`voice`、`speed`、`instructions`、`response_format` = `wav|pcm`，额外的 `sample_rate`）：
   分块传输，边合成边返回；`wav` 的长度字段写成最大值（流式 WAV）；要 mp3 等也给 wav（没带编码器）；
   认不出的音色名（`alloy` 等）用默认音色。
+
+## 四、用户音色（v0.5）
+
+用户自己的音色：一段录音克隆出来的，或者别处克隆好的 CosyVoice3 音色文件（prompt_speech gguf，比如「克隆声音」工具音色库里的 `<名字>.gguf`）
+导入进来。存在 `<models>/user-voices/<名字>.gguf`（模型目录各版本共用，更新不丢；`--user-voices` 可以换目录），启动时和包里的 `voices/`
+一起加载，运行中增删立刻生效（`ready.voices`、`/v1/voices` 里马上有）；和内置音色重名的不收。
+
+- `GET /v1/voices` → `{"voices": [全部], "user_voices": [用户的], "default": "default", "clone": 能不能克隆}`。
+- `POST /v1/voice/clone`（multipart）：`file` 录音（wav / mp3 / flac；3 秒起，最好 8～15 秒、只有这一个人、安静；超过 30 秒只用前 30 秒）、
+  `name` 音色名（1–40 个字，不能有 `\ / : * ? " < > |`，不以点开头）、可选 `text`（这段录音说了什么；空 = 自己听写，口音重时手填更准）、
+  `language`（听写用，默认 auto）、`replace`（`true` 时同名的用户音色换掉）→ `{"voice", "transcript", "seconds", "took"}`。
+  同一段录音解两份：16 kHz 给语音分词器和听写，24 kHz 给说话人向量和 mel（从原文件直接解，从 16 kHz 升上来声音发闷）。
+  要语音分词器（`frontend-onnx/speech_tokenizer_v3.int8.onnx`）和 campplus 都在、包带了 ONNX Runtime，否则回 501（`/v1/voices` 的 `clone` 为 false）。
+- `POST /v1/voice/import`（multipart）：`file`（.gguf）、`name`、`replace` → `{"voice", "took"}`；不是音色文件回 400
+  （先用 ggml 的 gguf 解析器检查四个张量 feat / embedding / tokens / text，cosyvoice.cpp 读到坏文件会直接崩）。
+- `DELETE /v1/voice/<名字>`（名字按 URL 编码）→ `{"deleted"}`；内置的 403、没有的 404。正在念的那段念完才删。
+- 命令行：`friday-voice clone --models <目录> --reference 录音 [--voice 名] [--text 底稿] [--output 音色.gguf]`。
+- `/v1/info` 的 `capabilities`：有用户音色目录时 `voiceImport`，能克隆时再加 `voiceCloning`；`models.user_voices` 列用户音色。

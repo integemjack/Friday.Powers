@@ -32,9 +32,9 @@ bool readAll(ma_decoder& decoder, std::vector<float>& out)
 
 } // namespace
 
-bool decodeAudio(const void* data, size_t size, std::vector<float>& out, std::string* error)
+bool decodeAudio(const void* data, size_t size, std::vector<float>& out, std::string* error, int rate)
 {
-    ma_decoder_config config = ma_decoder_config_init(ma_format_f32, 1, kSampleRate);
+    ma_decoder_config config = ma_decoder_config_init(ma_format_f32, 1, ma_uint32(rate));
     ma_decoder decoder;
     if (ma_decoder_init_memory(data, size, &config, &decoder) != MA_SUCCESS) {
         if (error)
@@ -48,9 +48,9 @@ bool decodeAudio(const void* data, size_t size, std::vector<float>& out, std::st
     return ok;
 }
 
-bool decodeAudioFile(const std::string& path, std::vector<float>& out, std::string* error)
+bool decodeAudioFile(const std::string& path, std::vector<float>& out, std::string* error, int rate)
 {
-    ma_decoder_config config = ma_decoder_config_init(ma_format_f32, 1, kSampleRate);
+    ma_decoder_config config = ma_decoder_config_init(ma_format_f32, 1, ma_uint32(rate));
     ma_decoder decoder;
     if (ma_decoder_init_file(path.c_str(), &config, &decoder) != MA_SUCCESS) {
         if (error)

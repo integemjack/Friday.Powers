@@ -11,9 +11,9 @@ namespace voice {
 
 constexpr int kSampleRate = 16000;
 
-/// 解码一段内存里的音频文件；失败返回 false
-bool decodeAudio(const void* data, size_t size, std::vector<float>& out, std::string* error);
-bool decodeAudioFile(const std::string& path, std::vector<float>& out, std::string* error);
+/// 解码一段内存里的音频文件；失败返回 false。rate：解成多少采样率（v0.5 克隆要 24 kHz 的一份）
+bool decodeAudio(const void* data, size_t size, std::vector<float>& out, std::string* error, int rate = kSampleRate);
+bool decodeAudioFile(const std::string& path, std::vector<float>& out, std::string* error, int rate = kSampleRate);
 
 /// 16 位小端 PCM → float
 void pcm16ToFloat(const uint8_t* bytes, size_t size, std::vector<float>& out);

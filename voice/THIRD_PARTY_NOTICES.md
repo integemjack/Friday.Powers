@@ -20,6 +20,8 @@
 - Windows CUDA 包里的 `cublas64_*.dll`、`cublasLt64_*.dll` 来自 NVIDIA CUDA Toolkit，按
   [NVIDIA CUDA Toolkit EULA](https://docs.nvidia.com/cuda/eula/) 附录 A 允许再分发的部分随包分发。
 - Jetson 包静态链接了 CUDA 运行库和 cuBLAS（同一 EULA）。
+- [ONNX Runtime](https://github.com/microsoft/onnxruntime)（v0.5 起，MIT）：克隆音色用的前端（语音分词器、CAM++）跑在它上面，
+  预编译的动态库（Windows `onnxruntime.dll`、Linux `libonnxruntime.so.1`、macOS `libonnxruntime.<版本>.dylib`）放在可执行文件旁边。
 
 ## 模型（不在包里，第一次用时下载：Whisper 从 Hugging Face，别的从 ModelScope）
 
@@ -28,6 +30,7 @@
 | SenseVoice-Small、FSMN-VAD（FunAudioLLM 的 GGUF） | [FunASR 模型许可](https://github.com/modelscope/FunASR/blob/main/MODEL_LICENSE) |
 | Fun-CosyVoice3-0.5B-2512（Lourdle 转的 GGUF） | Apache-2.0 |
 | Whisper large-v3-turbo（OpenAI；whisper.cpp 转的 ggml，q5_0） | [MIT](https://github.com/openai/whisper/blob/main/LICENSE) |
+| CosyVoice3 的 speech_tokenizer_v3（Lourdle 转的 int8 ONNX，v0.5 克隆音色用） | Apache-2.0 |
 
 ## 音色
 

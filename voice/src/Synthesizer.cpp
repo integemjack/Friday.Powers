@@ -4,9 +4,13 @@
 
 #include "cosyvoice.h"
 #include "cosyvoice-lowlevel.h"   // 要在 cosyvoice.h 之后
+#include "ggml.h"
+#include "gguf.h"
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <mutex>
 
 namespace fs = std::filesystem;
 
@@ -27,19 +31,13 @@ Synthesizer::Synthesizer(const Backend& backend) : m_backend(backend)
 
 Synthesizer::~Synthesizer()
 {
-    for (auto& [name, v] : m_voices) {
-        if (v.tts)
-            cosyvoice_tts_context_free(v.tts);
-        if (v.prompt)
-            cosyvoice_prompt_free(v.prompt);
-        if (v.speech)
-            cosyvoice_prompt_speech_free(v.speech);
-    }
+    for (auto& [name, v] : m_voices)
+        freeVoice(v);
     if (m_ctx)
         cosyvoice_free(m_ctx);
 }
 
-bool Synthesizer::load(const std::string& modelPath, const std::string& voicesDir, std::string* error)
+bool Synthesizer::load(const std::string& modelPath, const std::string& voicesDir, std::string* error, const std::string& userVoicesDir)
 {
     const auto started = std::chrono::steady_clock::now();
     // cosyvoice 会接管传进去的 backend（用完自己释放），所以在选好的设备上另开一个
@@ -71,25 +69,13 @@ bool Synthesizer::load(const std::string& modelPath, const std::string& voicesDi
     m_sampleRate = int(cosyvoice_get_sample_rate(m_ctx));
 
     std::error_code ec;
-    for (const auto& entry : fs::directory_iterator(fs::u8path(voicesDir), ec)) {
-        if (!entry.is_regular_file() || entry.path().extension() != ".gguf")
-            continue;
-        const std::string name = entry.path().stem().u8string();
-        Voice v;
-        v.speech = cosyvoice_prompt_speech_load_from_file(entry.path().u8string().c_str());
-        if (v.speech)
-            v.prompt = cosyvoice_prompt_init_from_prompt_speech(m_ctx, v.speech);
-        if (v.prompt)
-            v.tts = cosyvoice_tts_context_new(m_ctx, v.prompt);
-        if (!v.tts) {
-            VLOG_WARN("音色 %s 加载失败，跳过", entry.path().u8string().c_str());
-            if (v.prompt)
-                cosyvoice_prompt_free(v.prompt);
-            if (v.speech)
-                cosyvoice_prompt_speech_free(v.speech);
-            continue;
-        }
-        m_voices[name] = v;
+    if (!scanVoices(voicesDir, false, error))
+        return false;
+    if (!userVoicesDir.empty() && fs::exists(fs::u8path(userVoicesDir), ec)) {
+        std::string userError;
+        scanVoices(userVoicesDir, true, &userError);   // 用户音色坏了不拖累启动，跳过就行
+        if (!userError.empty())
+            VLOG_WARN("用户音色目录扫出了问题（忽略）：%s", userError.c_str());
     }
     if (m_voices.empty()) {
         if (error)
@@ -97,9 +83,81 @@ bool Synthesizer::load(const std::string& modelPath, const std::string& voicesDi
         return false;
     }
     m_defaultVoice = m_voices.count("default") ? "default" : m_voices.begin()->first;
-    VLOG_INFO("CosyVoice3 已加载：%s（%d Hz，%d 个音色，每块 %u 个语音 token，%.1f 秒）", modelPath.c_str(), m_sampleRate,
-              int(m_voices.size()), cosyvoice_get_chunk_tokens(m_ctx), since(started));
+    VLOG_INFO("CosyVoice3 已加载：%s（%d Hz，%d 个音色（其中 %d 个用户克隆），每块 %u 个语音 token，%.1f 秒）", modelPath.c_str(), m_sampleRate,
+              int(m_voices.size()), int(std::count_if(m_voices.begin(), m_voices.end(), [](const auto& v) { return v.second.user; })),
+              cosyvoice_get_chunk_tokens(m_ctx), since(started));
     return true;
+}
+
+bool Synthesizer::scanVoices(const std::string& dir, bool user, std::string* error)
+{
+    if (dir.empty())
+        return true;
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(fs::u8path(dir), ec)) {
+        if (!entry.is_regular_file() || entry.path().extension() != ".gguf")
+            continue;
+        const std::string name = entry.path().stem().u8string();
+        if (name.empty() || name[0] == '.' || m_voices.count(name))
+            continue;   // 点开头的是正在写的临时文件；用户音色和内置同名：内置优先
+        Voice v;
+        v.user = user;
+        v.file = entry.path().u8string();
+        if (isVoiceFile(v.file))
+            v.speech = cosyvoice_prompt_speech_load_from_file(v.file.c_str());
+        if (!initVoice(v)) {
+            VLOG_WARN("音色 %s 加载失败，跳过", entry.path().u8string().c_str());
+            continue;
+        }
+        m_voices[name] = v;
+    }
+    if (ec && error)
+        *error = "打不开音色目录：" + dir;
+    return !ec;
+}
+
+bool Synthesizer::isVoiceFile(const std::string& path)
+{
+    ggml_context* meta = nullptr;
+    gguf_init_params params { true, &meta };
+    gguf_context* gguf = gguf_init_from_file(path.c_str(), params);   // ggml_fopen：Windows 上 UTF-8 路径也认
+    if (!gguf)
+        return false;
+    const auto has = [&](const char* name, ggml_type type, int dims) {
+        const ggml_tensor* t = meta ? ggml_get_tensor(meta, name) : nullptr;
+        return t && t->type == type && ggml_n_dims(t) <= dims && ggml_nelements(t) > 0;
+    };
+    const bool ok = has("feat", GGML_TYPE_F32, 2) && has("embedding", GGML_TYPE_F32, 2) && has("tokens", GGML_TYPE_I32, 1)
+                    && has("text", GGML_TYPE_I8, 1);
+    gguf_free(gguf);
+    if (meta)
+        ggml_free(meta);
+    return ok;
+}
+
+bool Synthesizer::initVoice(Voice& v)
+{
+    if (v.speech)
+        v.prompt = cosyvoice_prompt_init_from_prompt_speech(m_ctx, v.speech);
+    if (v.prompt)
+        v.tts = cosyvoice_tts_context_new(m_ctx, v.prompt);
+    if (v.tts)
+        return true;
+    freeVoice(v);
+    return false;
+}
+
+void Synthesizer::freeVoice(Voice& v)
+{
+    if (v.tts)
+        cosyvoice_tts_context_free(v.tts);
+    if (v.prompt)
+        cosyvoice_prompt_free(v.prompt);
+    if (v.speech)
+        cosyvoice_prompt_speech_free(v.speech);
+    v.tts = nullptr;
+    v.prompt = nullptr;
+    v.speech = nullptr;
 }
 
 void Synthesizer::setChunkTokens(unsigned tokens)
@@ -115,10 +173,113 @@ unsigned Synthesizer::chunkTokens() const
 
 std::vector<std::string> Synthesizer::voices() const
 {
+    std::lock_guard<std::mutex> lock(m_voicesMutex);
     std::vector<std::string> names;
     for (const auto& [name, v] : m_voices)
         names.push_back(name);
     return names;
+}
+
+std::vector<std::string> Synthesizer::userVoices() const
+{
+    std::lock_guard<std::mutex> lock(m_voicesMutex);
+    std::vector<std::string> names;
+    for (const auto& [name, v] : m_voices) {
+        if (v.user)
+            names.push_back(name);
+    }
+    return names;
+}
+
+bool Synthesizer::hasVoice(const std::string& voice) const
+{
+    std::lock_guard<std::mutex> lock(m_voicesMutex);
+    return m_voices.count(voice) > 0;
+}
+
+bool Synthesizer::isUserVoice(const std::string& voice) const
+{
+    std::lock_guard<std::mutex> lock(m_voicesMutex);
+    const auto it = m_voices.find(voice);
+    return it != m_voices.end() && it->second.user;
+}
+
+std::string Synthesizer::defaultVoice() const
+{
+    std::lock_guard<std::mutex> lock(m_voicesMutex);
+    return m_defaultVoice;
+}
+
+bool Synthesizer::addUserVoice(const std::string& name, cosyvoice_prompt_speech* speech, const std::string& file, bool replace,
+                               std::string* error)
+{
+    Voice v;
+    v.user = true;
+    v.file = file;
+    v.speech = speech;
+    if (!m_ctx) {
+        freeVoice(v);
+        if (error)
+            *error = "合成模型没加载";
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(m_mutex);   // 和正在念的互斥：等它念完再加（建 prompt 要用模型的分词）
+    {
+        std::lock_guard<std::mutex> voicesLock(m_voicesMutex);
+        const auto it = m_voices.find(name);
+        if (it != m_voices.end() && (!replace || !it->second.user)) {
+            freeVoice(v);
+            if (error)
+                *error = it->second.user ? "已有同名音色：" + name : "和内置音色重名：" + name;
+            return false;
+        }
+    }
+    if (!initVoice(v)) {
+        if (error)
+            *error = "音色用不了（不是 CosyVoice3 的音色文件，或者坏了）：" + name;
+        return false;
+    }
+    Voice old;
+    {
+        std::lock_guard<std::mutex> voicesLock(m_voicesMutex);
+        const auto it = m_voices.find(name);
+        if (it != m_voices.end())
+            old = it->second;
+        m_voices[name] = v;
+    }
+    freeVoice(old);   // 换掉的旧音色（文件已经被新的盖掉了，不删）
+    VLOG_INFO("音色已注册：%s（%s）", name.c_str(), file.c_str());
+    return true;
+}
+
+bool Synthesizer::removeVoice(const std::string& name, std::string* error)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);   // 正在念就等它念完
+    Voice v;
+    {
+        std::lock_guard<std::mutex> voicesLock(m_voicesMutex);
+        const auto it = m_voices.find(name);
+        if (it == m_voices.end()) {
+            if (error)
+                *error = "没有这个音色：" + name;
+            return false;
+        }
+        if (!it->second.user) {
+            if (error)
+                *error = "内置音色删不掉：" + name;
+            return false;
+        }
+        v = it->second;
+        m_voices.erase(it);
+        if (m_defaultVoice == name)
+            m_defaultVoice = m_voices.count("default") ? "default" : (m_voices.empty() ? std::string() : m_voices.begin()->first);
+    }
+    freeVoice(v);
+    std::error_code ec;
+    if (!v.file.empty())
+        fs::remove(fs::u8path(v.file), ec);   // gguf 文件一并删掉（下次启动不再加载）
+    VLOG_INFO("音色已删：%s（%s）", name.c_str(), ec ? "文件没删掉" : "连文件一起删了");
+    return true;
 }
 
 SpeakResult Synthesizer::speak(uint64_t owner, const std::string& text, const std::string& voice, float speed,
@@ -129,14 +290,20 @@ SpeakResult Synthesizer::speak(uint64_t owner, const std::string& text, const st
         result.error = "合成模型没加载";
         return result;
     }
-    const auto it = m_voices.find(voice.empty() ? m_defaultVoice : voice);
-    if (it == m_voices.end()) {
+    const auto queued = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(m_mutex);   // 拿到它之后音色不会被删（v0.5 增删音色也要它）
+    result.queuedSeconds = since(queued);
+    cosyvoice_tts_context* tts = nullptr;
+    {
+        std::lock_guard<std::mutex> voicesLock(m_voicesMutex);
+        const auto it = m_voices.find(voice.empty() ? m_defaultVoice : voice);
+        if (it != m_voices.end())
+            tts = it->second.tts;
+    }
+    if (!tts) {
         result.error = "没有这个音色：" + voice;
         return result;
     }
-    const auto queued = std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> lock(m_mutex);
-    result.queuedSeconds = since(queued);
     {
         std::lock_guard<std::mutex> ownerLock(m_ownerMutex);
         m_owner = owner;
@@ -162,8 +329,8 @@ SpeakResult Synthesizer::speak(uint64_t owner, const std::string& text, const st
     };
     const float rate = speed > 0.25f && speed < 4.0f ? speed : 1.0f;
     const bool ok = instruction.empty()
-        ? cosyvoice_tts_zero_shot_stream(it->second.tts, text.c_str(), rate, callback, &state)
-        : cosyvoice_tts_instruct_stream(it->second.tts, text.c_str(), instruction.c_str(), rate, callback, &state);
+        ? cosyvoice_tts_zero_shot_stream(tts, text.c_str(), rate, callback, &state)
+        : cosyvoice_tts_instruct_stream(tts, text.c_str(), instruction.c_str(), rate, callback, &state);
     {
         std::lock_guard<std::mutex> ownerLock(m_ownerMutex);
         m_owner = 0;

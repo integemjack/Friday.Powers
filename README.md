@@ -27,6 +27,9 @@ Friday 主程序只接在线模型、保持小巧；要用到本机 GPU 的重�
 - **中英混说**（v0.3）：一句说完后再交给 Whisper large-v3-turbo（[whisper.cpp](https://github.com/ggml-org/whisper.cpp) v1.9.5，同一份 ggml）
   出定稿，和 SenseVoice 的对齐合起来：中文用 SenseVoice 的、英文词用 Whisper 的（「C亏欠」→「Secret Chat」），客户端给的热词
   （项目名之类）交给 Whisper（5080 上一句多花约 0.05 秒，M1 上约 1 秒）。Windows、Mac、Linux x64、Jetson Orin 的包带它，ARM64 Vulkan 不带。
+- **自己的音色**（v0.5）：一段 8～15 秒的录音克隆出这个人的声音（CosyVoice3 零样本：语音分词器 int8 + CAM++ 跑在 ONNX Runtime 上，
+  M1 上一次约 2 秒；没给底稿就自己听写），或者导入别处克隆好的音色文件（.gguf）；存在模型目录的 `user-voices/`，热生效。
+  ONNX Runtime 是动态库，放在可执行文件旁边（所以 v0.5 起包里不再只有一个 exe）。
 - 用在 Friday 的：桌面端语音模式、助手的 SChat 通话、会议 / 听课的连续听写 + 逐句分析。
 
 | 平台 | 加速 | 说明 |

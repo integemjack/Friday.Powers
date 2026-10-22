@@ -31,6 +31,7 @@ def licenses(build: Path, dest: Path):
         "whisper.cpp.txt": [deps / "whisper-src" / "LICENSE"],
         "pcre2.txt": [deps / "pcre2-src" / "LICENCE.md", deps / "pcre2-src" / "LICENCE"],
         "FunASR.txt": [VOICE / "third_party" / "funasr" / "LICENSE"],
+        "onnxruntime.txt": [deps / "onnxruntime" / "LICENSE"],
     }
     for name, candidates in found.items():
         for c in candidates:
@@ -71,6 +72,11 @@ def main():
         shutil.copytree(build / "bin" / "voices", stage / "voices")
     for extra in args.extra:
         shutil.copy2(extra, stage / Path(extra).name)
+    # v0.5 克隆前端带的 ONNX Runtime（动态库，exe 旁：Windows onnxruntime.dll，Linux libonnxruntime.so.1，
+    # macOS libonnxruntime.<版本>.dylib；没编克隆就没有）
+    for ort in (build / "bin").glob("*onnxruntime*"):
+        if ort.is_file() and ort.suffix in (".dll", ".dylib") or ".so" in ort.name:
+            shutil.copy2(ort, stage / ort.name)
 
     manifest = json.loads((VOICE / "power.json").read_text(encoding="utf-8"))
     target = manifest["targets"][args.target]

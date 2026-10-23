@@ -67,7 +67,7 @@ llm/build-cuda/bin/friday-llm serve --models <模型库目录> --port 0
 python llm/tools/concurrency_test.py --url http://127.0.0.1:端口 --model 组织/仓库:量化档
 ```
 
-## 第四个 Power：`devices`（客户端设备，v2.73）
+## 第四个 Power：`devices`（客户端设备，v2.78）
 
 - 让 Friday 的智能体用**远程客户端（Friday Work 桌面客户端）那台电脑上的硬件**：ESP / Arduino / STM32 开发板的串口开成本机
   `rfc2217://127.0.0.1:端口`（esptool / PlatformIO / idf.py 直接用），在客户端本机烧录（ESP、UF2、Arduino STK500、STM32 串口引导），

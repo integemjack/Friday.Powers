@@ -1,5 +1,5 @@
 # friday-devices：各平台编译、跑端到端测试（devices/tools/bridge_test.py）、打包；
-# 推 devices-vX.Y.Z 标签时发 Release 并更新 index Release 里的索引（Friday 2.73 起认这个 Power 的通用平台包）。
+# 推 devices-vX.Y.Z 标签时发 Release 并更新 index Release 里的索引（Friday 2.78 起认这个 Power 的通用平台包）。
 # 不用显卡：每个系统 / 架构只有一种包（windows-x64、macos-arm64、linux-x64、linux-arm64）。
 name: devices
 
@@ -86,7 +86,8 @@ jobs:
       - name: 编译、测试
         run: |
           docker run --rm -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 -v "$PWD:/src" -w /src ubuntu:22.04 bash -c \
-            "set -e; apt-get update; apt-get install -y --no-install-recommends build-essential cmake ninja-build python3 ca-certificates;
+            "set -e; apt-get update; apt-get install -y --no-install-recommends build-essential ninja-build python3 python3-pip ca-certificates;
+             pip3 install --no-cache-dir 'cmake>=3.28';
              cmake -S devices -B build -G Ninja -DCMAKE_BUILD_TYPE=Release; cmake --build build;
              ./build/bin/friday-devices --version; python3 devices/tools/bridge_test.py ./build/bin/friday-devices"
       - name: 打包
@@ -115,6 +116,6 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           gh release create "$TAG" dist/devices-*.zip dist/devices-*.tar.gz --title "$TAG" \
-            --notes "friday-devices ${TAG#devices-v}：客户端设备（远程客户端那台电脑上的串口、摄像头、手机、局域网设备）。各平台包见附件，Friday 2.73 起通过 index 里的 index-v2.json 按需下载。" \
+            --notes "friday-devices ${TAG#devices-v}：客户端设备（远程客户端那台电脑上的串口、摄像头、手机、局域网设备）。各平台包见附件，Friday 2.78 起通过 index 里的 index-v2.json 按需下载。" \
             || gh release upload "$TAG" dist/devices-*.zip dist/devices-*.tar.gz --clobber
           python3 ci/publish_index.py --power devices --dist dist --tag "$TAG" --repo "$GITHUB_REPOSITORY"

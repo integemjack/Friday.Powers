@@ -18,7 +18,7 @@ WebSerial / getUserMedia / adb …  ⇆  WebRTC 工作通道 ⇆ remote/ClientDe
 
 同 [power-spec.md](power-spec.md) §2：`serve --host 127.0.0.1 --port 0 --token T --parent-stdin`，就绪打一行
 `{"event":"listening","url":…}`，`GET /health`、`GET /v1/info`（`bridge`：Friday 接没接上、`clients`、`ports`）。能力 id `clientDevices`。
-清单 schema 2，平台包是不带加速后缀的 `windows-x64`、`macos-arm64`、`linux-x64`、`linux-arm64`（Friday 2.73 起认：放在加速包后面）。
+清单 schema 2，平台包是不带加速后缀的 `windows-x64`、`macos-arm64`、`linux-x64`、`linux-arm64`（Friday 2.78 起认：放在加速包后面）。
 
 ## 2. 桥：`GET /v1/bridge`（WebSocket，带 token）
 

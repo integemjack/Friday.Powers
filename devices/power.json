@@ -1,0 +1,39 @@
+{
+  "schema": 2,
+  "id": "devices",
+  "title": "客户端设备",
+  "detail": "用远程客户端（Friday Work 桌面客户端）那台电脑上的硬件：ESP / Arduino / STM32 开发板（串口开成 rfc2217 端口、本机烧录）、摄像头拍照、安卓手机（adb）、iOS 设备、局域网里的树莓派等（TCP 隧道）。动硬件前客户端那头的人会被问一次。不用显卡。",
+  "executable": "friday-devices",
+  "serve": [
+    "serve",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "0",
+    "--token",
+    "{token}",
+    "--parent-stdin"
+  ],
+  "capabilities": [
+    "clientDevices"
+  ],
+  "models": [],
+  "targets": {
+    "windows-x64": {
+      "detail": "Windows x64",
+      "models": []
+    },
+    "macos-arm64": {
+      "detail": "macOS，Apple 芯片",
+      "models": []
+    },
+    "linux-x64": {
+      "detail": "Linux x64（glibc 2.35 起）",
+      "models": []
+    },
+    "linux-arm64": {
+      "detail": "ARM64 Linux（树莓派 4 / 5、Jetson 等）",
+      "models": []
+    }
+  }
+}

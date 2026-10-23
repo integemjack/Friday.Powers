@@ -37,7 +37,8 @@ Power 是 Friday 按需下载、按需启动、可以热加载 / 卸载的本地
 }
 ```
 
-target 命名：`<os>-<arch>-<加速>`。Friday 按本机情况挑：Windows / Linux x64 默认 vulkan，有 NVIDIA 驱动时可选 cuda；
+target 命名：`<os>-<arch>-<加速>`；不用显卡的 Power（devices）只发 `<os>-<arch>` 一种（`windows-x64`、`macos-arm64`、`linux-x64`、`linux-arm64`），
+Friday 2.73 起把它排在加速包后面认（更早的 Friday 看不到这种包，也就不列这个 Power）。Friday 按本机情况挑：Windows / Linux x64 默认 vulkan，有 NVIDIA 驱动时可选 cuda；
 Jetson 按 `/etc/nv_tegra_release` 认 Orin（R36）；初代 Jetson Nano（R32）v2.7 起不支持。
 
 ### 1.1 共用运行库（runtimes，v2.7.1 起）
@@ -110,6 +111,7 @@ schema 2 的清单多两个字段：`library`（`{format: "gguf", kinds: ["text"
 | `realtimeSpeech` | `GET /v1/realtime/speak`（WebSocket） | 边写边读：文字流进去、音频流出来，可打断，见 `voice-protocol.md` |
 | `chat` | `POST /v1/chat/completions`（OpenAI 兼容 + `x_friday`） | 本地大模型（llm），多并发 + 基数树前缀共享，见 `llm-protocol.md` |
 | `imageGeneration` / `videoGeneration` | `POST /v1/jobs`、`POST /v1/images/generations` | 本地生图 / 生视频（diffusion），见 `diffusion-protocol.md` |
+| `clientDevices` | `GET /v1/bridge`（WebSocket）、`POST /mcp` | 客户端设备（devices，Friday 2.73 起）：远程客户端那台电脑上的串口、摄像头、手机、局域网设备，见 `devices-protocol.md` |
 
 吃显存的 Power（llm、diffusion）另有 `POST /v1/memory/release`：卸载模型、腾显存。llm 还有 `POST /v1/memory/reserve`：给别的程序留显存（Friday 生图 / 生视频前让 llm 留出地方，见 [llm-protocol.md](llm-protocol.md) §1.1）。
 

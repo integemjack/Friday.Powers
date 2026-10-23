@@ -1,4 +1,4 @@
-"""把一个 Power（llm、diffusion；voice 用 voice/ci/package.py）在一个平台的构建结果打成发布包：
+"""把一个 Power（llm、diffusion、devices；voice 用 voice/ci/package.py）在一个平台的构建结果打成发布包：
     python ci/package.py --power llm --target windows-x64-vulkan --build llm/build --out dist [--extra 某.dll ...]
 
 包里：可执行文件、power.json（填好版本和平台）、LICENSES/、附带的库（如 cuBLAS）。
@@ -24,6 +24,9 @@ LICENSES = {
     "diffusion": {
         "stable-diffusion.cpp.txt": ["sdcpp-src/LICENSE"],
         "ggml.txt": ["sdcpp-src/ggml/LICENSE"],
+        "civetweb.txt": ["civetweb-src/LICENSE.md"],
+    },
+    "devices": {
         "civetweb.txt": ["civetweb-src/LICENSE.md"],
     },
 }

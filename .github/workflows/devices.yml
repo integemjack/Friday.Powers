@@ -1,0 +1,120 @@
+# friday-devices：各平台编译、跑端到端测试（devices/tools/bridge_test.py）、打包；
+# 推 devices-vX.Y.Z 标签时发 Release 并更新 index Release 里的索引（Friday 2.73 起认这个 Power 的通用平台包）。
+# 不用显卡：每个系统 / 架构只有一种包（windows-x64、macos-arm64、linux-x64、linux-arm64）。
+name: devices
+
+on:
+  push:
+    branches: [main]
+    tags: ['devices-v*']
+    paths: ['devices/**', 'ci/**', '.github/workflows/devices.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: devices-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: windows-x64
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x64
+      - uses: seanmiddleditch/gha-setup-ninja@v6
+      - name: 编译、测试
+        shell: pwsh
+        run: |
+          cmake -S devices -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\build\bin\friday-devices.exe --version
+          python devices/tools/bridge_test.py "$PWD\build\bin\friday-devices.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: 打包
+        shell: pwsh
+        run: python ci/package.py --power devices --target windows-x64 --build build --out dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-x64
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    name: macos-arm64
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: 编译、测试
+        run: |
+          brew list ninja >/dev/null 2>&1 || brew install ninja
+          cmake -S devices -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0
+          cmake --build build
+          ./build/bin/friday-devices --version
+          python3 devices/tools/bridge_test.py ./build/bin/friday-devices
+      - name: 打包
+        run: python3 ci/package.py --power devices --target macos-arm64 --build build --out dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-arm64
+          path: dist/*
+          if-no-files-found: error
+
+  # Linux 两种架构都在 ubuntu:22.04 里编（glibc 2.35：树莓派 OS bookworm 是 2.36，跑得了）
+  linux:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            runner: ubuntu-24.04
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - name: 编译、测试
+        run: |
+          docker run --rm -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 -v "$PWD:/src" -w /src ubuntu:22.04 bash -c \
+            "set -e; apt-get update; apt-get install -y --no-install-recommends build-essential cmake ninja-build python3 ca-certificates;
+             cmake -S devices -B build -G Ninja -DCMAKE_BUILD_TYPE=Release; cmake --build build;
+             ./build/bin/friday-devices --version; python3 devices/tools/bridge_test.py ./build/bin/friday-devices"
+      - name: 打包
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" build
+          python3 ci/package.py --power devices --target ${{ matrix.target }} --build build --out dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/devices-v')
+    needs: [windows, macos, linux]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: 发布
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/devices-*.zip dist/devices-*.tar.gz --title "$TAG" \
+            --notes "friday-devices ${TAG#devices-v}：客户端设备（远程客户端那台电脑上的串口、摄像头、手机、局域网设备）。各平台包见附件，Friday 2.73 起通过 index 里的 index-v2.json 按需下载。" \
+            || gh release upload "$TAG" dist/devices-*.zip dist/devices-*.tar.gz --clobber
+          python3 ci/publish_index.py --power devices --dist dist --tag "$TAG" --repo "$GITHUB_REPOSITORY"

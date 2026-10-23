@@ -67,6 +67,21 @@ llm/build-cuda/bin/friday-llm serve --models <模型库目录> --port 0
 python llm/tools/concurrency_test.py --url http://127.0.0.1:端口 --model 组织/仓库:量化档
 ```
 
+## 第四个 Power：`devices`（客户端设备，v2.73）
+
+- 让 Friday 的智能体用**远程客户端（Friday Work 桌面客户端）那台电脑上的硬件**：ESP / Arduino / STM32 开发板的串口开成本机
+  `rfc2217://127.0.0.1:端口`（esptool / PlatformIO / idf.py 直接用），在客户端本机烧录（ESP、UF2、Arduino STK500、STM32 串口引导），
+  摄像头拍照，安卓手机给本机的 adb（`ADB_SERVER_SOCKET`）、iOS 设备给 libimobiledevice（`USBMUXD_SOCKET_ADDRESS`），
+  客户端局域网里的树莓派等走 TCP 隧道，客户端本机的 openocd 也能远程连。
+- 不碰硬件：设备都是客户端开的（先问拿着设备的人）；这里只开本机端口、读固件文件，经 Friday 的工作通道中转，
+  再以 MCP 服务（`client__devices`、`client__serial_open`、`client__flash`……）给智能体。
+- 不用显卡、不要模型：civetweb + nlohmann/json 一个小可执行文件（Windows 约 0.7 MB）。协议见 [docs/devices-protocol.md](docs/devices-protocol.md)。
+
+```
+cmake -S devices -B devices/build -G Ninja && cmake --build devices/build
+python devices/tools/bridge_test.py devices/build/bin/friday-devices      # 端到端测试（假的 Friday + 客户端）
+```
+
 ## 第三个 Power：`diffusion`（本地生图 / 生视频，v2.7）
 
 - stable-diffusion.cpp（master-951，带它自己那份 ggml）：生图（Z-Image-Turbo、FLUX.2 klein、Qwen-Image）、按参考图改图、生视频（Wan2.2 TI2V 5B，WebM）；

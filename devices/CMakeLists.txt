@@ -6,7 +6,7 @@
 #   cmake -B build -G Ninja
 #   cmake --build build                              # 产物 build/bin/friday-devices
 cmake_minimum_required(VERSION 3.24)
-project(friday-devices VERSION 0.1.0 LANGUAGES C CXX)
+project(friday-devices VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -57,6 +57,7 @@ endif()
 add_executable(friday-devices
     src/main.cpp
     src/Bridge.cpp
+    src/Monitor.cpp
     src/Ports.cpp
     src/Server.cpp
     src/Socket.cpp

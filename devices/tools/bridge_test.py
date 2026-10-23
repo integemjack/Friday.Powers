@@ -105,6 +105,9 @@ class FakeFridayAndClient:
         self.ws = WebSocket("127.0.0.1", port, f"/v1/bridge?token={TOKEN}")
         self.channel_closes = []
         self.requests = []
+        # 每条通道收到的字节（串口监视的测试看 DTR / RTS 命令有没有发过来）；echo=False 的通道不回显
+        self.received = {}
+        self.quiet = set()
         self.ws.send(json.dumps({"type": "hello"}))
         self.ws.send(json.dumps({"type": "clients", "clients": [
             {"id": self.CLIENT, "name": "测试客户端 0.5.85（windows）", "kinds": ["serial", "tcp", "camera"]}]}))
@@ -119,6 +122,11 @@ class FakeFridayAndClient:
             message["result"] = result
         self.ws.send(json.dumps(message))
 
+    def push(self, label, data, raw=False):
+        """「板子」往通道里送字节（客户端是 RFC 2217 服务器：数据里的 0xFF 要双写；raw 时原样送，用来塞协商）"""
+        key = f"{self.CLIENT}\n{label}".encode()
+        self.ws.send(bytes([len(key)]) + key + (data if raw else data.replace(b"\xff", b"\xff\xff")), binary=True)
+
     def open_channel(self, label):
         self.ws.send(json.dumps({"type": "channel.open", "client": self.CLIENT, "label": label}))
 
@@ -129,7 +137,10 @@ class FakeFridayAndClient:
                 if opcode == 2:
                     h = payload[0]
                     key, data = payload[1:1 + h], payload[1 + h:]
-                    self.ws.send(bytes([h]) + key + data.upper(), binary=True)
+                    label = key.decode().split("\n", 1)[1]
+                    self.received[label] = self.received.get(label, b"") + data
+                    if label not in self.quiet:
+                        self.ws.send(bytes([h]) + key + data.upper(), binary=True)
                     continue
                 message = json.loads(payload)
                 if message["type"] == "channel.close":
@@ -154,6 +165,9 @@ class FakeFridayAndClient:
         elif method == "device.serial.open":
             assert params["deviceId"] == "serial:4292:60000:0" and params["mode"] == "rfc2217", params
             label = "friday-serial:s%d" % request["id"]
+            if params.get("baudRate") == 74880:   # 串口监视的测试：不回显，记下它发来的
+                self.quiet.add(label)
+                self.monitor_label = label
             self.open_channel(label)
             # 客户端开通道后先发协商字节，回复后到：这时还没认领，要攒着
             key = f"{self.CLIENT}\n{label}".encode()
@@ -275,6 +289,45 @@ def main():
         shot = call(port, "camera_snapshot")
         images = [c for c in shot["content"] if c["type"] == "image"]
         assert images and images[0]["mimeType"] == "image/jpeg", shot
+
+        # 串口监视：开（客户端那头协商 + 设波特率）→ 板子输出 → serial_read 等到 ready → 写一行 → 复位 → 关
+        opened = text_of(call(port, "serial_monitor", {"device_id": "serial:4292:60000:0", "baud_rate": 74880}))
+        assert "monitor_id=" in opened, opened
+        monitor_id = int(opened.split("monitor_id=")[1].split("（")[0])
+        label = bridge.monitor_label
+        deadline = time.time() + 5
+        while b"\xff\xfa\x2c\x01" not in bridge.received.get(label, b"") and time.time() < deadline:
+            time.sleep(0.05)
+        sent = bridge.received[label]
+        assert b"\xff\xfb\x2c" in sent, sent                                  # WILL COM-PORT-OPTION
+        assert b"\xff\xfa\x2c\x01\x00\x01\x24\x80\xff\xf0" in sent, sent     # SET-BAUDRATE 74880
+        bridge.push(label, b"rst:0x1 (POWERON)\r\nboot: \xff ok\r\n")
+        bridge.push(label, b"\xff\xfb\x00", raw=True)       # 混进来的协商：不该出现在输出里
+        threading.Timer(0.5, lambda: bridge.push(label, b"WiFi ready\r\n")).start()
+        out = text_of(call(port, "serial_read", {"monitor_id": monitor_id, "until": "ready", "wait_s": 10}))
+        assert "等到了" in out and "POWERON" in out and "WiFi ready" in out, out
+        # 0xFF 去掉转义后原样留着（十六进制读）
+        hexed = text_of(call(port, "serial_read", {"monitor_id": monitor_id, "cursor": 0, "hex": True, "wait_s": 0}))
+        assert " ff 20 6f 6b" in hexed and "fb 00" not in hexed, hexed
+        # 没有新输出：等一会儿回空
+        empty = text_of(call(port, "serial_read", {"monitor_id": monitor_id, "wait_s": 0.2}))
+        assert "0 字节" in empty, empty
+        before = len(bridge.received[label])
+        call(port, "serial_write", {"monitor_id": monitor_id, "line": "AT"})
+        call(port, "serial_write", {"monitor_id": monitor_id, "hex": "ff 01"})
+        time.sleep(0.3)
+        written = bridge.received[label][before:]
+        assert written == b"AT\r\n\xff\xff\x01", written
+        before = len(bridge.received[label])
+        assert "已复位" in text_of(call(port, "serial_reset", {"monitor_id": monitor_id}))
+        time.sleep(0.3)
+        reset = bridge.received[label][before:]
+        # DTR off、RTS on、RTS off（SET-CONTROL 9 / 11 / 12）
+        assert reset == b"".join(b"\xff\xfa\x2c\x05" + bytes([v]) + b"\xff\xf0" for v in (9, 11, 12)), reset
+        listed = json.loads(text_of(call(port, "ports")))
+        assert listed["monitors"][0]["id"] == monitor_id, listed
+        assert "已关" in text_of(call(port, "serial_close", {"monitor_id": monitor_id}))
+        assert call(port, "serial_read", {"monitor_id": monitor_id}).get("isError")
 
         # 端口表、关端口
         ports = json.loads(text_of(call(port, "ports")))["ports"]

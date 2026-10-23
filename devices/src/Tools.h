@@ -5,6 +5,7 @@
 #pragma once
 
 #include "Bridge.h"
+#include "Monitor.h"
 #include "Ports.h"
 
 #include <condition_variable>
@@ -41,6 +42,12 @@ private:
     json runTool(const json& args);
     json stopTool(const json& args);
     json jobWait(const json& args);
+    json serialMonitor(const json& args);
+    json serialRead(const json& args);
+    json serialWrite(const json& args);
+    json serialReset(const json& args);
+    json serialClose(const json& args);
+    std::shared_ptr<Monitor> monitor(const json& args);
 
     /// 起一个后台任务，最多等 waitSeconds 秒：做完回结果，没做完回 job_id
     json startJob(const std::string& title, int waitSeconds, std::function<json(Job&)> work);
@@ -57,6 +64,9 @@ private:
     int m_nextJob = 0;
     /// 后台跑着的工具（run_tool background）：client + runId → 状态（device.tool.exited 来了更新）
     std::map<std::string, json> m_toolRuns;
+    /// 串口监视：id → 会话（输出缓冲在里面）
+    std::map<int, std::shared_ptr<Monitor>> m_monitors;
+    int m_nextMonitor = 0;
 };
 
 } // namespace devices

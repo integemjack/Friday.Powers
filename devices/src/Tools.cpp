@@ -174,7 +174,39 @@ json Tools::list() const
         "把客户端的 usbmuxd（iOS 设备服务，Windows 上要装 Apple 设备 / iTunes）开成本机端口，"
         "之后设 USBMUXD_SOCKET_ADDRESS=127.0.0.1:端口 用 libimobiledevice / pymobiledevice3。iOS 17 起的开发者服务要另起隧道，编译签名要 Mac。",
         schema({ { "port", kLocalPort }, { "client", kClientProperty } }));
-    add("ports", "列出开着的本机端口（串口、隧道、adb、usbmux）、上面的连接数和最近的错误，以及后台跑着的客户端工具。",
+    add("serial_monitor",
+        "开一个串口监视：客户端那个串口的输出一直缓存在这里（最近 512 KB），之后用 serial_read 取新输出、serial_write 发数据、"
+        "serial_reset 复位板子看启动日志，用完 serial_close。不用在服务端写脚本、装 pyserial。同一个口同时只能开一个（和 serial_open 的端口互斥）；"
+        "这个口烧录时监视不断，烧完接着收新固件的输出。",
+        schema({ { "device_id", { { "type", "string" }, { "description", "devices 给的 serial:… 标识" } } },
+                 { "baud_rate", { { "type", "integer" }, { "description", "默认 115200" } } },
+                 { "client", kClientProperty } },
+               { "device_id" }));
+    add("serial_read",
+        "取串口监视的新输出（从上次读到的地方接着读，或从给的 cursor 读）。wait_s 秒内没有新输出就回空；给 until 时等到输出里出现这段文字为止"
+        "（如 \"ready\"、\"WiFi connected\"）。回 text（或 hex）和下一次的 cursor。",
+        schema({ { "monitor_id", { { "type", "integer" } } },
+                 { "wait_s", { { "type", "number" }, { "description", "最多等多少秒（默认 2，最多 90）" } } },
+                 { "until", { { "type", "string" }, { "description", "等到输出里出现这段文字" } } },
+                 { "cursor", { { "type", "integer" }, { "description", "从这个位置读（serial_read 回的 cursor；0 = 从开头留着的读）" } } },
+                 { "max_bytes", { { "type", "integer" }, { "description", "最多回多少字节（默认 16384）" } } },
+                 { "hex", { { "type", "boolean" }, { "description", "按十六进制回（二进制协议用）" } } } },
+               { "monitor_id" }));
+    add("serial_write",
+        "往串口发数据：text 原样发，line 发完补换行（newline 默认 \\r\\n），hex 发十六进制字节（如 \"7e 01 00\"）。",
+        schema({ { "monitor_id", { { "type", "integer" } } },
+                 { "text", { { "type", "string" } } },
+                 { "line", { { "type", "string" } } },
+                 { "newline", { { "type", "string" } } },
+                 { "hex", { { "type", "string" } } } },
+               { "monitor_id" }));
+    add("serial_reset",
+        "复位板子（之后用 serial_read 看启动日志）：mode=rts 是 ESP 的复位（RTS 拉 EN 低 100 ms，DTR 放开 = 正常启动，默认），"
+        "mode=dtr 是 Arduino 的复位（DTR 拉一下）。",
+        schema({ { "monitor_id", { { "type", "integer" } } }, { "mode", { { "type", "string" }, { "enum", { "rts", "dtr" } } } } },
+               { "monitor_id" }));
+    add("serial_close", "关掉一个串口监视（串口还给客户端）。", schema({ { "monitor_id", { { "type", "integer" } } } }, { "monitor_id" }));
+    add("ports", "列出开着的本机端口（串口、隧道、adb、usbmux）、串口监视、上面的连接数和最近的错误，以及后台跑着的客户端工具。",
         schema(json::object()), true);
     add("port_close", "关一个本机端口（ports 给的 id）和它上面的连接。",
         schema({ { "id", { { "type", "integer" } } } }, { "id" }));
@@ -255,6 +287,16 @@ json Tools::call(const std::string& name, const json& arguments)
             return stopTool(args);
         if (name == "job_wait")
             return jobWait(args);
+        if (name == "serial_monitor")
+            return serialMonitor(args);
+        if (name == "serial_read")
+            return serialRead(args);
+        if (name == "serial_write")
+            return serialWrite(args);
+        if (name == "serial_reset")
+            return serialReset(args);
+        if (name == "serial_close")
+            return serialClose(args);
         return errorResult("没有这个工具：" + name);
     } catch (const DeviceError& error) {
         return errorResult(error.message + "（错误码 " + std::to_string(error.code) + "）");
@@ -398,6 +440,10 @@ json Tools::portsTool(const json&)
 {
     json out { { "ports", m_ports.list() } };
     std::lock_guard<std::mutex> lock(m_mutex);
+    json monitors = json::array();
+    for (const auto& [id, monitor] : m_monitors)
+        monitors.push_back(monitor->describe());
+    out["monitors"] = monitors;
     json runs = json::array();
     for (const auto& [key, run] : m_toolRuns)
         runs.push_back(run);
@@ -411,6 +457,106 @@ json Tools::portClose(const json& args)
     if (!m_ports.close(id))
         throw DeviceError { -32602, "没有这个端口：" + std::to_string(id) };
     return textResult("端口 " + std::to_string(id) + " 已关");
+}
+
+// MARK: - 串口监视
+
+std::shared_ptr<Monitor> Tools::monitor(const json& args)
+{
+    const int id = optionalInt(args, "monitor_id", 0);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const auto it = m_monitors.find(id);
+    if (it == m_monitors.end())
+        throw DeviceError { -32602, "没有这个串口监视：" + std::to_string(id) + "（用 serial_monitor 开，ports 里看开着的）" };
+    return it->second;
+}
+
+json Tools::serialMonitor(const json& args)
+{
+    const ClientInfo client = m_bridge.pickClient(optionalString(args, "client"));
+    const std::string deviceId = requireString(args, "device_id");
+    const int baudRate = std::clamp(optionalInt(args, "baud_rate", 115200), 50, 16000000);
+    int id = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        id = ++m_nextMonitor;
+    }
+    auto session = std::make_shared<Monitor>(m_bridge, id, client.id, client.name, deviceId, deviceLabel(client, deviceId));
+    session->open(baudRate);
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_monitors[id] = session;
+    }
+    return textResult("已开串口监视 monitor_id=" + std::to_string(id) + "（" + session->describe().value("target", deviceId) + "，" +
+                      std::to_string(baudRate) + " 波特）。用 serial_read 取输出、serial_reset 复位看启动日志、serial_write 发数据。");
+}
+
+json Tools::serialRead(const json& args)
+{
+    const auto session = monitor(args);
+    const double waitSeconds = args.contains("wait_s") && args["wait_s"].is_number() ? args["wait_s"].get<double>() : 2.0;
+    const int waitMs = int(std::clamp(waitSeconds, 0.0, 90.0) * 1000);
+    const long long cursor = args.contains("cursor") && args["cursor"].is_number_integer() ? args["cursor"].get<long long>() : -1;
+    const size_t maxBytes = size_t(std::clamp(optionalInt(args, "max_bytes", 16384), 64, 262144));
+    const json out = session->read(cursor, waitMs, optionalString(args, "until"), maxBytes, args.value("hex", false));
+    std::string head = "cursor=" + std::to_string(out.value("cursor", 0ULL)) + "，" + std::to_string(out.value("bytes", 0ULL)) + " 字节";
+    if (out.value("more", false))
+        head += "，后面还有（再读一次）";
+    if (out.contains("found"))
+        head += out.value("found", false) ? "，等到了" : "，没等到";
+    if (out.value("closed", false))
+        head += "，会话已关：" + out.value("closeReason", std::string());
+    if (out.contains("dropped"))
+        head += "，" + out.value("dropped", std::string());
+    return textResult(head + "\n" + (out.contains("hex") ? out.value("hex", std::string()) : out.value("text", std::string())));
+}
+
+json Tools::serialWrite(const json& args)
+{
+    const auto session = monitor(args);
+    std::string data;
+    if (args.contains("hex") && args["hex"].is_string()) {
+        std::string digits;
+        for (char c : args["hex"].get<std::string>()) {
+            if (std::isxdigit(uint8_t(c)))
+                digits.push_back(c);
+            else if (c != ' ' && c != ',' && c != ':')
+                throw DeviceError { -32602, "hex 只能是十六进制数字（可以用空格隔开）" };
+        }
+        if (digits.size() % 2 != 0)
+            throw DeviceError { -32602, "hex 的位数要是偶数" };
+        for (size_t i = 0; i < digits.size(); i += 2)
+            data.push_back(char(std::stoi(digits.substr(i, 2), nullptr, 16)));
+    } else if (args.contains("line") && args["line"].is_string()) {
+        data = args["line"].get<std::string>() + (args.contains("newline") && args["newline"].is_string() ? args["newline"].get<std::string>() : "\r\n");
+    } else if (args.contains("text") && args["text"].is_string()) {
+        data = args["text"].get<std::string>();
+    } else {
+        throw DeviceError { -32602, "要给 text、line 或 hex" };
+    }
+    session->write(data);
+    return textResult("已发 " + std::to_string(data.size()) + " 字节（用 serial_read 看回应）");
+}
+
+json Tools::serialReset(const json& args)
+{
+    const auto session = monitor(args);
+    const std::string mode = optionalString(args, "mode").empty() ? "rts" : optionalString(args, "mode");
+    if (mode != "rts" && mode != "dtr")
+        throw DeviceError { -32602, "mode 只能是 rts（ESP）/ dtr（Arduino）" };
+    session->reset(mode);
+    return textResult("已复位（" + mode + "）。用 serial_read（可带 until）看启动日志。");
+}
+
+json Tools::serialClose(const json& args)
+{
+    const auto session = monitor(args);
+    session->close();
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_monitors.erase(session->id());
+    }
+    return textResult("串口监视 " + std::to_string(session->id()) + " 已关");
 }
 
 // MARK: - 烧录、芯片、摄像头

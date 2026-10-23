@@ -71,6 +71,7 @@ python llm/tools/concurrency_test.py --url http://127.0.0.1:端口 --model 组�
 
 - 让 Friday 的智能体用**远程客户端（Friday Work 桌面客户端）那台电脑上的硬件**：ESP / Arduino / STM32 开发板的串口开成本机
   `rfc2217://127.0.0.1:端口`（esptool / PlatformIO / idf.py 直接用），在客户端本机烧录（ESP、UF2、Arduino STK500、STM32 串口引导），
+  串口监视（`serial_monitor` / `serial_read` / `serial_write` / `serial_reset`：智能体直接看日志、发指令、复位看启动输出），
   摄像头拍照，安卓手机给本机的 adb（`ADB_SERVER_SOCKET`）、iOS 设备给 libimobiledevice（`USBMUXD_SOCKET_ADDRESS`），
   客户端局域网里的树莓派等走 TCP 隧道，客户端本机的 openocd 也能远程连。
 - 不碰硬件：设备都是客户端开的（先问拿着设备的人）；这里只开本机端口、读固件文件，经 Friday 的工作通道中转，

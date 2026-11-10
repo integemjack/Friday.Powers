@@ -73,6 +73,10 @@ private:
     std::atomic<uint64_t> m_turn { 1 };
     std::atomic<bool> m_closed { false };
     std::thread m_thread;
+
+    // 合成线程用：对方手里还剩多少没放（挑块大小）；打断过（换了一轮）对方把没放的都丢了，重新算
+    PlaybackClock m_clock;
+    uint64_t m_clockTurn = 0;
 };
 
 } // namespace voice

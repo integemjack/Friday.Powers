@@ -698,22 +698,27 @@ int Server::handleSpeech(mg_connection* conn)
     std::string pcm;
     size_t total = 0;
     double firstAudio = -1;
+    PlaybackClock clock;   // v0.5.1 分块按对方手里剩多少挑（同边写边读）
     for (const std::string& segment : segments) {
-        const SpeakResult r = m_synth->speak(owner, segment, voice, speed, instruction, [&](const float* samples, size_t count) {
-            if (firstAudio < 0)
-                firstAudio = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-            resampled.clear();
-            resampler.process(samples, count, resampled);
-            pcm.clear();
-            floatToPcm16(resampled.data(), resampled.size(), pcm);
-            total += resampled.size();
-            sendHeaders();
-            if (mg_send_chunk(conn, pcm.data(), unsigned(pcm.size())) < 0) {
-                broken = true;   // 对方断开了
-                return false;
-            }
-            return true;
-        });
+        const SpeakResult r = m_synth->speak(
+            owner, segment, voice, speed, instruction,
+            [&](const float* samples, size_t count) {
+                if (firstAudio < 0)
+                    firstAudio = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+                resampled.clear();
+                resampler.process(samples, count, resampled);
+                pcm.clear();
+                floatToPcm16(resampled.data(), resampled.size(), pcm);
+                total += resampled.size();
+                sendHeaders();
+                if (mg_send_chunk(conn, pcm.data(), unsigned(pcm.size())) < 0) {
+                    broken = true;   // 对方断开了
+                    return false;
+                }
+                clock.sent(resampled.size() / double(std::max(1, sampleRate)), true);
+                return true;
+            },
+            [&clock] { return clock.ahead(); });
         if (broken)
             break;
         if (!r.ok) {

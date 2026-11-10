@@ -23,7 +23,53 @@ double since(std::chrono::steady_clock::time_point t)
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
 }
 
+// 流式分块（v0.5.1）。参考耗时：RTX 2060 + Vulkan、CosyVoice3 Q8、142 KB 的克隆音色（2026-11-10 用 speak --chunk-tokens 28/56/84/112 量的）：
+// 一段的第一块约 0.77 + 0.0083·n 秒，之后每块约 1.10 + 0.0098·n 秒（n = 这块的语音 token 数）。固定开销大（每块 flow 都带着音色的
+// 提示 mel 算一遍），块小了总速度跟不上：28 个一块时实时率 1.6，84 个 0.76，112 个 0.63。别的机器、音色乘各自学出来的系数
+constexpr unsigned kChunkStep = 14;
+constexpr unsigned kNextChunk = 84;     // 第一块之后的块
+constexpr unsigned kMaxChunk = 140;     // 念的那头剩得多时最大到这么多
+constexpr double kTokenSeconds = 0.04;  // CosyVoice3 的语音 token 是 25 Hz：1 倍速一个 0.04 秒
+
+double firstChunkCost(unsigned n)
+{
+    return 0.77 + 0.0083 * n;
+}
+
+double nextChunkCost(unsigned n)
+{
+    return 1.10 + 0.0098 * n;
+}
+
 } // namespace
+
+unsigned Synthesizer::pickFirstChunk(double scale, double secondsPerToken, double ahead) const
+{
+    // 念的那头剩的够等一个大块：第一声早晚无所谓，挑剩的盖得住的最大块
+    if (ahead >= firstChunkCost(kNextChunk) * scale) {
+        unsigned n = kNextChunk;
+        while (n + kChunkStep <= kMaxChunk && firstChunkCost(n + kChunkStep) * scale <= ahead)
+            n += kChunkStep;
+        return n;
+    }
+    // 不然挑最小的、念完它（加上剩的）时下一个大块已经合成好的
+    for (unsigned n = m_minChunk; n < kNextChunk; n += kChunkStep) {
+        if (ahead + n * secondsPerToken >= nextChunkCost(kNextChunk) * scale)
+            return n;
+    }
+    return kNextChunk;
+}
+
+unsigned Synthesizer::pickNextChunk(double scale, double secondsPerToken, double ahead) const
+{
+    // 大块也跟不上实时（慢机器、CPU 吃满）：放空免不了，用最大的块，总速度最快（客户端攒够再放时等得最少）
+    if (nextChunkCost(kNextChunk) * scale > kNextChunk * secondsPerToken)
+        return kMaxChunk;
+    unsigned n = kNextChunk;
+    while (n + kChunkStep <= kMaxChunk && nextChunkCost(n + kChunkStep) * scale <= ahead)
+        n += kChunkStep;
+    return n;
+}
 
 Synthesizer::Synthesizer(const Backend& backend) : m_backend(backend)
 {
@@ -67,6 +113,7 @@ bool Synthesizer::load(const std::string& modelPath, const std::string& voicesDi
     }
     m_path = modelPath;
     m_sampleRate = int(cosyvoice_get_sample_rate(m_ctx));
+    m_minChunk = std::max(kChunkStep, cosyvoice_get_chunk_tokens(m_ctx));
 
     std::error_code ec;
     if (!scanVoices(voicesDir, false, error))
@@ -83,9 +130,10 @@ bool Synthesizer::load(const std::string& modelPath, const std::string& voicesDi
         return false;
     }
     m_defaultVoice = m_voices.count("default") ? "default" : m_voices.begin()->first;
-    VLOG_INFO("CosyVoice3 已加载：%s（%d Hz，%d 个音色（其中 %d 个用户克隆），每块 %u 个语音 token，%.1f 秒）", modelPath.c_str(), m_sampleRate,
-              int(m_voices.size()), int(std::count_if(m_voices.begin(), m_voices.end(), [](const auto& v) { return v.second.user; })),
-              cosyvoice_get_chunk_tokens(m_ctx), since(started));
+    VLOG_INFO("CosyVoice3 已加载：%s（%d Hz，%d 个音色（其中 %d 个用户克隆），流式分块 %u–%u 个语音 token 自适应，%.1f 秒）", modelPath.c_str(),
+              m_sampleRate, int(m_voices.size()),
+              int(std::count_if(m_voices.begin(), m_voices.end(), [](const auto& v) { return v.second.user; })), m_minChunk, kMaxChunk,
+              since(started));
     return true;
 }
 
@@ -162,13 +210,8 @@ void Synthesizer::freeVoice(Voice& v)
 
 void Synthesizer::setChunkTokens(unsigned tokens)
 {
-    if (m_ctx && tokens > 0)
-        cosyvoice_set_chunk_tokens(m_ctx, tokens);
-}
-
-unsigned Synthesizer::chunkTokens() const
-{
-    return m_ctx ? cosyvoice_get_chunk_tokens(m_ctx) : 0;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_fixedChunk = tokens;
 }
 
 std::vector<std::string> Synthesizer::voices() const
@@ -283,7 +326,7 @@ bool Synthesizer::removeVoice(const std::string& name, std::string* error)
 }
 
 SpeakResult Synthesizer::speak(uint64_t owner, const std::string& text, const std::string& voice, float speed,
-                               const std::string& instruction, const OnAudio& onAudio)
+                               const std::string& instruction, const OnAudio& onAudio, const Ahead& ahead)
 {
     SpeakResult result;
     if (!m_ctx) {
@@ -294,9 +337,11 @@ SpeakResult Synthesizer::speak(uint64_t owner, const std::string& text, const st
     std::lock_guard<std::mutex> lock(m_mutex);   // 拿到它之后音色不会被删（v0.5 增删音色也要它）
     result.queuedSeconds = since(queued);
     cosyvoice_tts_context* tts = nullptr;
+    std::string voiceName;
     {
         std::lock_guard<std::mutex> voicesLock(m_voicesMutex);
-        const auto it = m_voices.find(voice.empty() ? m_defaultVoice : voice);
+        voiceName = voice.empty() ? m_defaultVoice : voice;
+        const auto it = m_voices.find(voiceName);
         if (it != m_voices.end())
             tts = it->second.tts;
     }
@@ -309,25 +354,59 @@ SpeakResult Synthesizer::speak(uint64_t owner, const std::string& text, const st
         m_owner = owner;
     }
 
+    const float rate = speed > 0.25f && speed < 4.0f ? speed : 1.0f;
+    // 分块：cosyvoice_tts_stream 每块开头都重新读一次块大小，所以在回调里（块与块之间）改下一块的
+    const bool adaptive = m_fixedChunk == 0;
+    double& scale = m_costScale.try_emplace(voiceName, 1.0).first->second;
+    const double secondsPerToken = kTokenSeconds / rate;
+    const unsigned firstChunk = adaptive ? pickFirstChunk(scale, secondsPerToken, ahead ? ahead() : 0.0) : m_fixedChunk;
+    cosyvoice_set_chunk_tokens(m_ctx, firstChunk);
+
     struct State {
+        Synthesizer* self;
         const OnAudio* onAudio;
+        const Ahead* ahead;
+        double* scale;
+        double secondsPerToken;
+        bool adaptive;
         std::chrono::steady_clock::time_point started;
+        std::chrono::steady_clock::time_point last;   // 上一块交出去（回调返回）的时候：到这一块来之间是合成这块用的
+        std::vector<unsigned> chunks;                 // 每块要的 token 数（最后多一个没用上的，收尾时去掉）
         size_t samples = 0;
+        int callbacks = 0;
         double firstAudio = 0;
         bool aborted = false;
-    } state { &onAudio, std::chrono::steady_clock::now() };
+    } state { this, &onAudio, &ahead, &scale, secondsPerToken, adaptive, std::chrono::steady_clock::now(), {}, { firstChunk } };
+    state.last = state.started;
     const auto callback = [](const float* audio, uint32_t count, void* user) -> bool {
         auto* s = static_cast<State*>(user);
-        if (s->samples == 0)
+        const double spent = since(s->last);
+        const bool first = s->samples == 0;
+        if (first)
             s->firstAudio = since(s->started);
         s->samples += count;
+        ++s->callbacks;
         if (!(*s->onAudio)(audio, count)) {
             s->aborted = true;
             return false;
         }
+        if (s->adaptive) {
+            // 学这台、这个音色的耗时系数：只看满的块（最后不满的一块的固定开销摊不开，会把系数拉高）
+            const unsigned requested = s->chunks.back();
+            const double tokens = count / (s->self->m_sampleRate * s->secondsPerToken);
+            if (tokens >= requested * 0.7) {
+                const double reference = first ? firstChunkCost(requested) : nextChunkCost(requested);
+                const double ratio = std::clamp(spent / reference, 0.05, 20.0);
+                const double weight = first ? 0.15 : 0.3;
+                *s->scale = *s->scale * (1 - weight) + ratio * weight;
+            }
+            const unsigned next = s->self->pickNextChunk(*s->scale, s->secondsPerToken, *s->ahead ? (*s->ahead)() : 0.0);
+            cosyvoice_set_chunk_tokens(s->self->m_ctx, next);
+            s->chunks.push_back(next);
+        }
+        s->last = std::chrono::steady_clock::now();
         return true;
     };
-    const float rate = speed > 0.25f && speed < 4.0f ? speed : 1.0f;
     const bool ok = instruction.empty()
         ? cosyvoice_tts_zero_shot_stream(tts, text.c_str(), rate, callback, &state)
         : cosyvoice_tts_instruct_stream(tts, text.c_str(), instruction.c_str(), rate, callback, &state);
@@ -335,6 +414,9 @@ SpeakResult Synthesizer::speak(uint64_t owner, const std::string& text, const st
         std::lock_guard<std::mutex> ownerLock(m_ownerMutex);
         m_owner = 0;
     }
+    if (state.chunks.size() > size_t(std::max(1, state.callbacks)))
+        state.chunks.resize(size_t(std::max(1, state.callbacks)));
+    result.chunks = std::move(state.chunks);
     result.seconds = since(state.started);
     result.firstAudioSeconds = state.firstAudio;
     result.samples = state.samples;

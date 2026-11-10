@@ -5,7 +5,9 @@
 
 #include "Backend.h"
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -29,11 +31,53 @@ struct SpeakResult {
     double seconds = 0;         // 合成用时
     double firstAudioSeconds = 0;   // 开始到第一块音频
     double queuedSeconds = 0;       // 排队等别人合成完的时间
+    std::vector<unsigned> chunks;   // 每块要的语音 token 数（自适应分块挑的，调参看）
+};
+
+/// v0.5.1 念的那头「到了就放」时手里还剩多少没放的声音（估）。边写边读按它挑下一块多大：剩得多就用大块（总速度快），
+/// 剩得少第一块就小（第一声早）。新 Friday 会先攒够再放，实际剩得比这里估的多，估少了只是块挑小了些
+class PlaybackClock {
+public:
+    /// 刚发出去 seconds 秒的声音；inSegment = 同一段里的后续块（这时放空了算一次断档，段与段之间等字不算）
+    void sent(double seconds, bool inSegment)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (!m_started || now >= m_end) {
+            if (m_started && inSegment) {
+                m_gapSeconds += std::chrono::duration<double>(now - m_end).count();
+                ++m_gaps;
+            }
+            m_started = true;
+            m_end = now;
+        }
+        m_end += std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(seconds));
+    }
+    double ahead() const
+    {
+        if (!m_started)
+            return 0;
+        return std::max(0.0, std::chrono::duration<double>(m_end - std::chrono::steady_clock::now()).count());
+    }
+    double gapSeconds() const { return m_gapSeconds; }
+    int gaps() const { return m_gaps; }
+    void resetGaps()
+    {
+        m_gapSeconds = 0;
+        m_gaps = 0;
+    }
+
+private:
+    bool m_started = false;
+    std::chrono::steady_clock::time_point m_end;
+    double m_gapSeconds = 0;
+    int m_gaps = 0;
 };
 
 class Synthesizer {
 public:
     using OnAudio = std::function<bool(const float* samples, size_t count)>;   // 返回 false 中止
+    /// 念的那头现在手里还剩多少秒没放（PlaybackClock::ahead）；每块之间问一次，空 = 当作 0
+    using Ahead = std::function<double()>;
 
     explicit Synthesizer(const Backend& backend);
     ~Synthesizer();
@@ -59,13 +103,17 @@ public:
     /// 删掉一个用户音色和它的文件（正在合成则等它完）；内置音色、没有的返回 false
     bool removeVoice(const std::string& name, std::string* error);
     std::string defaultVoice() const;
-    /// 流式时每块多少个语音 token（越小第一声越早，太小拖慢总速度）；0 = 模型默认
+    /// 流式时每块固定多少个语音 token（越小第一声越早，太小拖慢总速度；调参、对比用）；0 = 自适应（v0.5.1 默认，见 speak）
     void setChunkTokens(unsigned tokens);
-    unsigned chunkTokens() const;
+    /// 固定的块大小；自适应时是 0
+    unsigned chunkTokens() const { return m_fixedChunk; }
 
-    /// 合成一段（阻塞到合成完）。owner 用来让 stop(owner) 只叫停自己那段
+    /// 合成一段（阻塞到合成完）。owner 用来让 stop(owner) 只叫停自己那段。
+    /// 自适应分块（没设 setChunkTokens）：每块都有一笔固定开销（flow 带着音色的提示 mel 算一遍，2060 上约 1.1 秒），块小了总速度跟不上
+    /// 实时（克隆音色 1.3 倍速每块 28 个 token 时实时率 1.6）。第一块挑「刚好盖住下一块合成时间」的最小块，之后用大块；
+    /// 念的那头手里剩得多（ahead）就直接上大块。每块的耗时边念边学（按音色）
     SpeakResult speak(uint64_t owner, const std::string& text, const std::string& voice, float speed, const std::string& instruction,
-                      const OnAudio& onAudio);
+                      const OnAudio& onAudio, const Ahead& ahead = {});
     /// 叫停 owner 正在合成的那段（没在合成就什么也不做）；会等它停下来
     void stop(uint64_t owner);
 
@@ -94,6 +142,14 @@ private:
     mutable std::mutex m_voicesMutex;      // m_voices / m_defaultVoice（要两把时先 m_mutex 后它）
     std::mutex m_ownerMutex;
     uint64_t m_owner = 0;                  // 正在合成的是谁（0 = 没有）
+
+    // 分块（m_mutex 管）
+    unsigned m_fixedChunk = 0;             // 固定块大小（0 = 自适应）
+    unsigned m_minChunk = 28;              // 自适应的最小块：模型默认的块
+    /// 每个音色的耗时系数：实测耗时 / 参考耗时（参考是 2060 + Vulkan 上克隆音色量的，见 Synthesizer.cpp）
+    std::map<std::string, double> m_costScale;
+    unsigned pickFirstChunk(double scale, double secondsPerToken, double ahead) const;
+    unsigned pickNextChunk(double scale, double secondsPerToken, double ahead) const;
 };
 
 } // namespace voice

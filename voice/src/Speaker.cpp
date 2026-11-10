@@ -114,6 +114,10 @@ void Speaker::run()
         }
         if (!current(job.turn))
             continue;
+        if (job.turn != m_clockTurn) {
+            m_clock = PlaybackClock();
+            m_clockTurn = job.turn;
+        }
         if (job.endOfTurn)
             m_sendText(json { { "type", "done" } }.dump());
         else
@@ -128,18 +132,23 @@ void Speaker::speakOne(const Job& job, const SpeakConfig& config)
     std::vector<float> resampled;
     std::string pcm;
     size_t sent = 0;
-    const SpeakResult r = m_synth.speak(m_id, job.text, config.voice, config.speed, config.instruction,
-                                        [&](const float* samples, size_t count) {
-                                            if (!current(job.turn))
-                                                return false;
-                                            resampled.clear();
-                                            resampler.process(samples, count, resampled);
-                                            pcm.clear();
-                                            floatToPcm16(resampled.data(), resampled.size(), pcm);
-                                            sent += resampled.size();
-                                            m_sendBinary(pcm);
-                                            return true;
-                                        });
+    int chunk = 0;
+    m_clock.resetGaps();
+    const SpeakResult r = m_synth.speak(
+        m_id, job.text, config.voice, config.speed, config.instruction,
+        [&](const float* samples, size_t count) {
+            if (!current(job.turn))
+                return false;
+            resampled.clear();
+            resampler.process(samples, count, resampled);
+            pcm.clear();
+            floatToPcm16(resampled.data(), resampled.size(), pcm);
+            sent += resampled.size();
+            m_sendBinary(pcm);
+            m_clock.sent(resampled.size() / double(std::max(1, config.sampleRate)), chunk++ > 0);
+            return true;
+        },
+        [this] { return m_clock.ahead(); });
     if (!current(job.turn))
         return;   // 被打断的那一轮：cancel 已经回了 cancelled，不再发它的事件
     if (!r.ok && !r.stopped) {
@@ -147,11 +156,17 @@ void Speaker::speakOne(const Job& job, const SpeakConfig& config)
         return;
     }
     const double audioSeconds = r.samples / double(std::max(1, m_synth.sampleRate()));
-    VLOG_DEBUG("念第 %d 段：%.2f 秒音频，合成 %.3f 秒（首块 %.3f 秒，排队 %.3f 秒）%s：%s", job.index, audioSeconds, r.seconds,
-               r.firstAudioSeconds, r.queuedSeconds, r.stopped ? "，被打断" : "", job.text.c_str());
+    std::string chunks;
+    for (unsigned n : r.chunks)
+        chunks += (chunks.empty() ? "" : "/") + std::to_string(n);
+    VLOG_DEBUG("念第 %d 段：%.2f 秒音频，合成 %.3f 秒（首块 %.3f 秒，排队 %.3f 秒，分块 %s，到了就放会断 %d 次共 %.2f 秒）%s：%s", job.index,
+               audioSeconds, r.seconds, r.firstAudioSeconds, r.queuedSeconds, chunks.c_str(), m_clock.gaps(), m_clock.gapSeconds(),
+               r.stopped ? "，被打断" : "", job.text.c_str());
+    // v0.5.1 多 chunks（每块要的语音 token 数）、gap_ms（对方到了就放的话这段中间会放空多久，估的）
     m_sendText(json { { "type", "segment_end" }, { "index", job.index }, { "audio_ms", int64_t(sent * 1000 / std::max(1, config.sampleRate)) },
                       { "first_audio_ms", int64_t(r.firstAudioSeconds * 1000) }, { "infer_ms", int64_t(r.seconds * 1000) },
-                      { "queued_ms", int64_t(r.queuedSeconds * 1000) }, { "stopped", r.stopped } }
+                      { "queued_ms", int64_t(r.queuedSeconds * 1000) }, { "stopped", r.stopped }, { "chunks", r.chunks },
+                      { "gap_ms", int64_t(m_clock.gapSeconds() * 1000) } }
                    .dump());
 }
 

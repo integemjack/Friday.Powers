@@ -394,24 +394,38 @@ int runSpeak(const Options& o, const voice::Backend& backend)
         audio.clear();
         const auto started = std::chrono::steady_clock::now();
         double firstAudio = -1;
+        // v0.5.1 按边写边读的样子量：字一下子都有了，段接着段合成。clock 当对方「到了就放」，记中间放空几次；
+        // startNeeded = 对方要先攒到什么时候开口才一路不断（每块到的时间 - 它前面的声音长度，取最大）
+        voice::PlaybackClock clock;
+        double startNeeded = 0;
         for (const std::string& segment : segments) {
-            const voice::SpeakResult r = synth.speak(1, segment, o.voice, o.speed, o.instruction, [&](const float* s, size_t n) {
-                if (firstAudio < 0)
-                    firstAudio = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-                audio.insert(audio.end(), s, s + n);
-                return true;
-            });
+            const voice::SpeakResult r = synth.speak(
+                1, segment, o.voice, o.speed, o.instruction,
+                [&](const float* s, size_t n) {
+                    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+                    if (firstAudio < 0)
+                        firstAudio = now;
+                    startNeeded = std::max(startNeeded, now - audio.size() / double(synth.sampleRate()));
+                    audio.insert(audio.end(), s, s + n);
+                    clock.sent(n / double(synth.sampleRate()), true);
+                    return true;
+                },
+                [&clock] { return clock.ahead(); });
             if (!r.ok) {
                 VLOG_ERROR("%s", r.error.c_str());
                 return 5;
             }
-            VLOG_INFO("  「%s」%.2f 秒音频，合成 %.3f 秒，首块 %.3f 秒", segment.c_str(), r.samples / double(synth.sampleRate()), r.seconds,
-                      r.firstAudioSeconds);
+            std::string chunks;
+            for (unsigned c : r.chunks)
+                chunks += (chunks.empty() ? "" : "/") + std::to_string(c);
+            VLOG_INFO("  「%s」%.2f 秒音频，合成 %.3f 秒，首块 %.3f 秒，分块 %s", segment.c_str(), r.samples / double(synth.sampleRate()),
+                      r.seconds, r.firstAudioSeconds, chunks.c_str());
         }
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         const double audioSeconds = audio.size() / double(synth.sampleRate());
-        VLOG_INFO("第 %d 次：%d 段，%.2f 秒音频，用时 %.3f 秒（实时率 %.3f，首块 %.3f 秒）", round + 1, int(segments.size()), audioSeconds,
-                  seconds, seconds / std::max(0.001, audioSeconds), firstAudio);
+        VLOG_INFO("第 %d 次：%d 段，%.2f 秒音频，用时 %.3f 秒（实时率 %.3f，首块 %.3f 秒；到了就放断 %d 次共 %.2f 秒，%.3f 秒开口才不断）", round + 1,
+                  int(segments.size()), audioSeconds, seconds, seconds / std::max(0.001, audioSeconds), firstAudio, clock.gaps(),
+                  clock.gapSeconds(), startNeeded);
     }
     if (!writeWav(o.output, audio, synth.sampleRate())) {
         VLOG_ERROR("写不了 %s", o.output.c_str());

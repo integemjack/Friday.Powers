@@ -5,7 +5,7 @@
 | 项目 | 许可 | 用途 |
 |---|---|---|
 | [ggml](https://github.com/ggml-org/ggml) | MIT | 推理（CPU / CUDA / Vulkan / Metal / OpenCL） |
-| [cosyvoice.cpp](https://github.com/Lourdle/cosyvoice.cpp) | MIT | CosyVoice3 合成 |
+| [cosyvoice.cpp](https://github.com/Lourdle/cosyvoice.cpp) | MIT | CosyVoice3 合成（v0.5.2 起打了自己的补丁，见 `patches/cosyvoice/`） |
 | [whisper.cpp](https://github.com/ggml-org/whisper.cpp)（v1.9.5，只用 src/whisper.cpp） | MIT | 听写定稿（中英混说） |
 | [FunASR](https://github.com/modelscope/FunASR)（llama.cpp runtime 的 SenseVoice / FSMN-VAD 实现，作参考移植） | MIT | 听写、断句 |
 | [civetweb](https://github.com/civetweb/civetweb) | MIT | HTTP / WebSocket 服务 |

@@ -25,6 +25,25 @@
     "voiceImport",
     "voiceCloning"
   ],
+  "options": [
+    {
+      "key": "diffusionSteps",
+      "title": "朗读的合成步数",
+      "detail": "边写边读每段声音要算几遍（CosyVoice3 的扩散步数）。标准 10 步；慢的电脑（M1 这类 Mac、入门显卡）念的时候一卡一卡的，选 5 步快约四成，声音细节略差一点。改了以后本地语音重新启动。",
+      "env": "FRIDAY_VOICE_DIFFUSION_STEPS",
+      "default": 0,
+      "choices": [
+        {
+          "value": 0,
+          "title": "标准（10 步）"
+        },
+        {
+          "value": 5,
+          "title": "快（5 步）"
+        }
+      ]
+    }
+  ],
   "models": [
     {
       "id": "sensevoice-small-q8",

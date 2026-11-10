@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <filesystem>
 #include <mutex>
 
@@ -23,9 +24,11 @@ double since(std::chrono::steady_clock::time_point t)
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
 }
 
-// 流式分块（v0.5.1）。参考耗时：RTX 2060 + Vulkan、CosyVoice3 Q8、142 KB 的克隆音色（2026-11-10 用 speak --chunk-tokens 28/56/84/112 量的）：
-// 一段的第一块约 0.77 + 0.0083·n 秒，之后每块约 1.10 + 0.0098·n 秒（n = 这块的语音 token 数）。固定开销大（每块 flow 都带着音色的
-// 提示 mel 算一遍），块小了总速度跟不上：28 个一块时实时率 1.6，84 个 0.76，112 个 0.63。别的机器、音色乘各自学出来的系数
+// 流式分块（v0.5.1）。0.5.1 时每块都有一笔大的固定开销（flow 带着音色的提示 mel 和前面念过的全部重算，RTX 2060 + Vulkan 上
+// 第一块约 0.77 + 0.0083·n 秒、之后每块 1.10 + 0.0098·n 秒），块小了总速度跟不上。0.5.2 起 DiT 带 KV 缓存和音色提示前缀（见 load），
+// 固定开销几乎没了。参考耗时：M1 + Metal、CosyVoice3 Q8、gentle-female（提示 8.8 秒）、1.3 倍速、10 步，开着 DiT 缓存
+// （2026-11-10 用 speak --chunk-tokens 28/56/84/112/140 量的）：一段的第一块约 0.36 + 0.038·n 秒，之后每块约 0.19 + 0.040·n 秒
+// （n = 这块的语音 token 数；其中大模型出 token 约 0.019·n）。别的机器、音色、步数乘各自学出来的系数
 constexpr unsigned kChunkStep = 14;
 constexpr unsigned kNextChunk = 84;     // 第一块之后的块
 constexpr unsigned kMaxChunk = 140;     // 念的那头剩得多时最大到这么多
@@ -33,13 +36,21 @@ constexpr double kTokenSeconds = 0.04;  // CosyVoice3 的语音 token 是 25 Hz�
 
 double firstChunkCost(unsigned n)
 {
-    return 0.77 + 0.0083 * n;
+    return 0.36 + 0.038 * n;
 }
 
 double nextChunkCost(unsigned n)
 {
-    return 1.10 + 0.0098 * n;
+    return 0.19 + 0.040 * n;
 }
+
+// 0.5.2 DiT（flow 的扩散步）KV 缓存：每一步一份、每份这么多个 mel 帧位置（25 Hz 的语音 token 一个 2 帧；音色提示最长约 15 秒 = 750 帧，
+// 加一段话最长约 20 秒 = 1000 帧）。超了不出错，只是最近的历史被覆盖、念得差一点；设备上放不下 2048 就退到 1280（够提示 + 十秒的一段）。
+// 每个位置 22 层 × 2（CFG 两路）× 1024 维，K 是 Q8_0（34/32 字节）、V 是 Q4_0（18/32）：10 步 × 2048 约 1.4 GB
+constexpr uint32_t kDitCacheLengths[] = { 2048, 1280 };
+constexpr double kDitBytesPerPosition = 22.0 * 2 * 1024 * (34.0 / 32 + 18.0 / 32);
+constexpr int kDefaultDiffusionSteps = 10;          // CosyVoice3 模型自带的步数
+constexpr double kDitCacheMargin = 1024.0 * 1024 * 1024;   // 放下缓存后设备上还要剩这么多（flow 的中间结果、大模型的 KV 等）
 
 } // namespace
 
@@ -100,6 +111,34 @@ bool Synthesizer::load(const std::string& modelPath, const std::string& voicesDi
         COSYVOICE_MAKE_SEPARATE_KV_CACHE(COSYVOICE_KV_CACHE_TYPE_Q8_0, COSYVOICE_KV_CACHE_TYPE_Q4_0, COSYVOICE_KV_CACHE_TYPE_Q8_0);
     params.base_params.dit_allow_kv_cache_fallback = true;
     params.strict_seed_mode = false;   // 不要求同一种子逐位相同，省一次预填充
+    params.diffusion_steps = m_diffusionSteps;   // 0 = 模型自带的（10）
+
+    // 0.5.2 DiT KV 缓存：流式时 flow 每块都跑一遍全部扩散步，没缓存时每步都把音色提示和这段前面念过的重算一遍
+    // （M1 上一步约 0.5 秒，10 步 × 每块 5 秒多，是慢的大头）。每步一份缓存（fixed slots = 步数，cosyvoice.cpp 会压到步数），
+    // 块与块之间只算新的；再打开音色提示前缀（我们的补丁 patches/cosyvoice），每段开头也不再重算音色的提示 mel。
+    // 设备上放不下（显存小、别的占着）就不开，退回 0.5.1 的样子
+    const int steps = m_diffusionSteps > 0 ? m_diffusionSteps : kDefaultDiffusionSteps;
+    m_ditCacheBytes = 0;
+    if (m_ditCache) {
+        size_t freeBytes = 0, totalBytes = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(backend), &freeBytes, &totalBytes);
+        std::error_code sizeError;
+        const auto fileSize = fs::file_size(fs::u8path(modelPath), sizeError);
+        const double modelBytes = sizeError ? 0.0 : double(fileSize);
+        for (const uint32_t length : kDitCacheLengths) {
+            const double cacheBytes = double(steps) * length * kDitBytesPerPosition;
+            if (freeBytes == 0 || double(freeBytes) >= cacheBytes + modelBytes + kDitCacheMargin) {
+                params.base_params.dit_kv_fixed_slots = 64;   // ≥ 步数就行，cosyvoice.cpp 压到步数（上限 50）
+                params.base_params.dit_kv_offloadable_slots = 0;
+                params.base_params.dit_kv_cache_length = length;
+                m_ditCacheBytes = cacheBytes;
+                break;
+            }
+        }
+        if (m_ditCacheBytes == 0)
+            VLOG_WARN("设备上剩的不够放 DiT 缓存（模型 %.0f MB，剩 %.0f MB），合成不开缓存（慢）", modelBytes / 1048576,
+                      double(freeBytes) / 1048576);
+    }
     // Metal 上 LLM 的 flash attention 算错（2026-10-08，M1 + ggml v0.26.0：念出来是乱语、一直念到长度上限，KV 缓存换 F16 也一样；
     // 关掉就对了）。flow 的 flash attention 没问题，留着（全关更慢）
     if (m_backend.isMetal())
@@ -114,6 +153,8 @@ bool Synthesizer::load(const std::string& modelPath, const std::string& voicesDi
     m_path = modelPath;
     m_sampleRate = int(cosyvoice_get_sample_rate(m_ctx));
     m_minChunk = std::max(kChunkStep, cosyvoice_get_chunk_tokens(m_ctx));
+    if (m_ditCacheBytes > 0)
+        cosyvoice_set_dit_prompt_prefix(m_ctx, true);
 
     std::error_code ec;
     if (!scanVoices(voicesDir, false, error))
@@ -130,10 +171,15 @@ bool Synthesizer::load(const std::string& modelPath, const std::string& voicesDi
         return false;
     }
     m_defaultVoice = m_voices.count("default") ? "default" : m_voices.begin()->first;
-    VLOG_INFO("CosyVoice3 已加载：%s（%d Hz，%d 个音色（其中 %d 个用户克隆），流式分块 %u–%u 个语音 token 自适应，%.1f 秒）", modelPath.c_str(),
-              m_sampleRate, int(m_voices.size()),
-              int(std::count_if(m_voices.begin(), m_voices.end(), [](const auto& v) { return v.second.user; })), m_minChunk, kMaxChunk,
-              since(started));
+    char cache[96];
+    if (m_ditCacheBytes > 0)
+        std::snprintf(cache, sizeof(cache), "DiT 缓存 %.0f MB + 音色提示前缀", m_ditCacheBytes / 1048576);
+    else
+        std::snprintf(cache, sizeof(cache), "DiT 不缓存");
+    VLOG_INFO("CosyVoice3 已加载：%s（%d Hz，%d 个音色（其中 %d 个用户克隆），扩散 %d 步，%s，流式分块 %u–%u 个语音 token 自适应，%.1f 秒）",
+              modelPath.c_str(), m_sampleRate, int(m_voices.size()),
+              int(std::count_if(m_voices.begin(), m_voices.end(), [](const auto& v) { return v.second.user; })),
+              cosyvoice_get_diffusion_steps(m_ctx), cache, m_minChunk, kMaxChunk, since(started));
     return true;
 }
 

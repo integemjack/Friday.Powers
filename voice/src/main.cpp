@@ -40,6 +40,7 @@
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -74,7 +75,8 @@ struct Options {
     std::string userVoices, cloneTokenizer, cloneCampplus;
     float speed = 1.0f;
     int port = 0, threads = 0, repeat = 1, chunkTokens = 0;
-    bool parentStdin = false, itn = true, verbose = false, tts = true, speaker = true, whisper = true, clone = true;
+    int diffusionSteps = -1;   // 0.5.2 合成的扩散步数：-1 = 没给（看 FRIDAY_VOICE_DIFFUSION_STEPS），0 = 模型自带
+    bool parentStdin = false, itn = true, verbose = false, tts = true, speaker = true, whisper = true, clone = true, ditCache = true;
     std::vector<std::string> inputs;
 };
 
@@ -86,6 +88,8 @@ void usage()
                  "                          [--host 127.0.0.1] [--port 0] [--device auto|cpu|cuda[:N]|vulkan[:N]|metal|opencl]\n"
                  "                          [--token T] [--threads N] [--parent-stdin] [--verbose]\n"
                  "                          [--tts-model COSYVOICE3.gguf --voices DIR | --no-tts]\n"
+                 "                          [--diffusion-steps N]（合成的扩散步数，0 = 模型自带的 10；没给时看 FRIDAY_VOICE_DIFFUSION_STEPS）\n"
+                 "                          [--no-dit-cache]（合成不开 DiT 缓存和音色提示前缀，0.5.1 的样子，对比用）\n"
                  "                          [--user-voices DIR]（用户克隆音色的目录，默认 <models>/user-voices；--no-clone 关掉克隆）\n"
                  "                          [--speaker-model CAMPPLUS.onnx | --no-speaker]（声纹：每句话 final 带上说话人特征）\n"
                  "                          [--whisper-model GGML-WHISPER.bin | --no-whisper]（定稿用 Whisper：中英混说准）\n"
@@ -93,7 +97,8 @@ void usage()
                  "  friday-voice clone      (--models DIR) --reference AUDIO [--voice 名] [--text 底稿] [--output OUT.gguf]\n"
                  "                          把一段 8~15 秒的录音提成本地音色（没给 text 就自动听写当底稿）（v0.5）\n"
                  "  friday-voice speak      (--models DIR | --tts-model COSYVOICE3.gguf --voices DIR) --text TEXT --output OUT.wav\n"
-                 "                          [--voice NAME] [--speed 1.0] [--instruction TEXT] [--repeat N]\n"
+                 "                          [--voice NAME] [--speed 1.0] [--instruction TEXT] [--repeat N] [--chunk-tokens N]\n"
+                 "                          [--diffusion-steps N] [--no-dit-cache]\n"
                  "  friday-voice speaker    (--models DIR | --speaker-model CAMPPLUS.onnx) AUDIO [AUDIO2 …]\n"
                  "                          打印每段的声纹（192 维），两段以上再打印两两的相似度；[--features F.bin] 用这份特征（测试用）\n"
                  "  friday-voice merge      SENSEVOICE文字 WHISPER文字 [--language zh]（看两边的听写怎么合起来，调试用）\n"
@@ -156,6 +161,11 @@ bool parse(int argc, char** argv, Options& o)
         } else if (a == "--chunk-tokens") {
             if (!next(v)) return false;
             o.chunkTokens = std::atoi(v.c_str());
+        } else if (a == "--diffusion-steps") {
+            if (!next(v)) return false;
+            o.diffusionSteps = std::max(0, std::atoi(v.c_str()));
+        } else if (a == "--no-dit-cache") {
+            o.ditCache = false;
         } else if (a == "--no-tts") {
             o.tts = false;
         } else if (a == "--speaker-model") {
@@ -310,6 +320,11 @@ bool resolveModels(Options& o, std::string* error)
         o.cloneCampplus.clear();
         o.clone = false;
     }
+    // 0.5.2 扩散步数：命令行没给就看环境变量（Friday 的「设置 › 能力」里选的，见 power.json 的 options）
+    if (o.diffusionSteps < 0) {
+        const char* env = std::getenv("FRIDAY_VOICE_DIFFUSION_STEPS");
+        o.diffusionSteps = env ? std::max(0, std::atoi(env)) : 0;
+    }
     // 默认音色随包发，在可执行文件旁边的 voices/
     if (o.voices.empty()) {
         const fs::path beside = executableDir() / "voices";
@@ -379,6 +394,8 @@ int runSpeak(const Options& o, const voice::Backend& backend)
         return 2;
     }
     voice::Synthesizer synth(backend);
+    synth.setDiffusionSteps(o.diffusionSteps);
+    synth.setDitCache(o.ditCache);
     std::string error;
     if (!synth.load(o.ttsModel, o.voices, &error, o.userVoices)) {
         VLOG_ERROR("%s", error.c_str());
@@ -725,6 +742,8 @@ int main(int argc, char** argv)
 #endif
     if (o.tts && !o.ttsModel.empty() && !o.voices.empty()) {
         synth = std::make_unique<voice::Synthesizer>(backend);
+        synth->setDiffusionSteps(o.diffusionSteps);
+        synth->setDitCache(o.ditCache);
         // v0.5 用户音色（克隆的、导入的）一起加载；导入不用克隆模型，所以 --no-clone 也照样加载
         if (synth->load(o.ttsModel, o.voices, &error, o.userVoices)) {
             synth->setChunkTokens(unsigned(std::max(0, o.chunkTokens)));

@@ -112,14 +112,15 @@ jobs:
           - target: linux-arm64-jetson-orin
             image: nvcr.io/nvidia/l4t-cuda:12.2.12-devel
             # cosyvoice.cpp 要 C++20 的 <format>（GCC 13 起才有）：C/C++ 用 PPA 的 GCC 13，nvcc 12.2 的宿主编译器仍是 GCC 11
+            # git：配置时给 cosyvoice.cpp 打补丁（voice/patches）
             setup: >-
-              apt-get update && apt-get install -y --no-install-recommends build-essential ninja-build python3 python3-pip ca-certificates binutils
+              apt-get update && apt-get install -y --no-install-recommends build-essential ninja-build python3 python3-pip ca-certificates binutils git
               software-properties-common gpg-agent && add-apt-repository -y ppa:ubuntu-toolchain-r/test && apt-get update &&
               apt-get install -y --no-install-recommends g++-13 && pip3 install --no-cache-dir 'cmake>=3.28'
           - target: linux-arm64-vulkan
             image: ubuntu:24.04
             setup: >-
-              apt-get update && apt-get install -y --no-install-recommends build-essential ninja-build cmake python3 ca-certificates binutils
+              apt-get update && apt-get install -y --no-install-recommends build-essential ninja-build cmake python3 ca-certificates binutils git
               libvulkan-dev glslc spirv-headers
     steps:
       - uses: actions/checkout@v7

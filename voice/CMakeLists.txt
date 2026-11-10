@@ -7,7 +7,7 @@
 #   cmake -B build -G Ninja -DVOICE_CUDA=ON          # 或 -DVOICE_VULKAN=ON，可同时开
 #   cmake --build build                               # 产物 build/bin/friday-voice
 cmake_minimum_required(VERSION 3.24)
-project(friday-voice VERSION 0.5.1 LANGUAGES C CXX)
+project(friday-voice VERSION 0.5.2 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -187,6 +187,9 @@ if(VOICE_TTS)
     if(NOT cosyvoice_POPULATED)
         FetchContent_Populate(cosyvoice)
     endif()
+    # 0.5.2 起给 cosyvoice.cpp 打自己的补丁（patches/cosyvoice/*.patch，每个开头一行说明）：配置时打，打过的跳过
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ApplyPatches.cmake)
+    voice_apply_patches(${cosyvoice_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/patches/cosyvoice)
     set(PCRE2_BUILD_PCRE2_8     ON  CACHE BOOL "" FORCE)
     set(PCRE2_BUILD_PCRE2_16    ON  CACHE BOOL "" FORCE)
     set(PCRE2_BUILD_TESTS       OFF CACHE BOOL "" FORCE)

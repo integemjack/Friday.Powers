@@ -1,0 +1,2 @@
+# 补丁按字节打（git apply），检出时不能转成 CRLF
+*.patch -text

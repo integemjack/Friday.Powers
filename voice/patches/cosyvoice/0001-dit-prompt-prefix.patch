@@ -1,0 +1,216 @@
+Friday: keep the voice prompt's DiT KV cache across streaming segments (cosyvoice_set_dit_prompt_prefix).
+diff --git a/include/cosyvoice-lowlevel.h b/include/cosyvoice-lowlevel.h
+--- a/include/cosyvoice-lowlevel.h
++++ b/include/cosyvoice-lowlevel.h
+@@ -377,6 +377,18 @@
+  */
+ COSYVOICE_API void cosyvoice_set_chunk_tokens(cosyvoice_context_t ctx, uint32_t n_tokens);
+ 
++/**
++ * @brief (Friday patch) Keep the voice prompt's DiT KV cache across streaming segments.
++ *
++ * Only takes effect while every diffusion step has a fixed DiT KV slot
++ * (`dit_kv_fixed_slots` == diffusion steps, no offloadable slots). The first streaming
++ * segment for a prompt runs the DiT once over the prompt alone (all steps) and keeps that
++ * KV prefix; every segment then starts as a continuation of it, so the prompt mel is not
++ * recomputed per segment. The prompt no longer attends to the first chunk of a segment
++ * (chunk-causal, as in upstream streaming). Switching prompts rebuilds the prefix.
++ */
++COSYVOICE_API void cosyvoice_set_dit_prompt_prefix(cosyvoice_context_t ctx, bool enabled);
++
+ // ----------------------------------------------------------------------------
+ // Tokenizer Operations
+ // ----------------------------------------------------------------------------
+diff --git a/src/cosyvoice-model.h b/src/cosyvoice-model.h
+--- a/src/cosyvoice-model.h
++++ b/src/cosyvoice-model.h
+@@ -39,6 +39,8 @@
+ 
+     std::unique_ptr<char[]> architecture;
+     std::unique_ptr<char[]> instruction_prefix;
++
++    bool dit_prompt_prefix = false; // Friday patch: see cosyvoice_set_dit_prompt_prefix
+ };
+ 
+ struct cosyvoice_worker_context
+@@ -77,6 +79,10 @@
+     std::vector<float> flow_cache;
+     std::vector<uint32_t> chunk_boundaries;
+     uint32_t offset{0};
++    // Friday patch: DiT KV prefix holding the voice prompt (positions [0, dit_prefix_len) of every slot)
++    uint64_t dit_prefix_key{0};
++    uint32_t dit_prefix_len{0};
++    bool dit_building_prefix{false};
+     std::unique_ptr<char[]> batch_buffer;
+     std::unique_ptr<float[]> nucleus_probs;
+     uint32_t nucleus_probs_capacity;
+diff --git a/src/cosyvoice-token2wav.cpp b/src/cosyvoice-token2wav.cpp
+--- a/src/cosyvoice-token2wav.cpp
++++ b/src/cosyvoice-token2wav.cpp
+@@ -90,6 +90,28 @@
+         }
+         ggml_backend_sched_set_tensor_backend(sched, node, target_backend);
+     }
++}
++
++// Friday patch: identifies the prompt whose DiT KV prefix is cached (FNV-1a over flow tokens, mel and speaker embedding).
++static uint64_t dit_prompt_prefix_key(const cosyvoice_prompt* prompt)
++{
++    uint64_t h = 1469598103934665603ull;
++    const auto mix = [&h](const void* data, size_t size)
++    {
++        const auto p = static_cast<const unsigned char*>(data);
++        for (size_t i = 0; i != size; ++i)
++        {
++            h ^= p[i];
++            h *= 1099511628211ull;
++        }
++    };
++    const auto& feat = prompt->prompt_speech_feat;
++    const auto& emb = prompt->flow_embedding;
++    mix(feat.shape, sizeof(feat.shape));
++    mix(prompt->flow_prompt_speech_tokens.first.get(), sizeof(int) * prompt->flow_prompt_speech_tokens.second);
++    mix(feat.data, sizeof(float) * feat.shape[0] * feat.shape[1]);
++    mix(emb.data, sizeof(float) * emb.shape[0] * emb.shape[1]);
++    return h | 1;
+ }
+ 
+ bool cosyvoice_model_3::token2wav(const int* token_ids, uint32_t n_tokens, float speed, cosyvoice_prompt_t prompt, cosyvoice_generated_speech_ptr result)
+@@ -218,11 +240,67 @@
+     auto op_caps = shared->op_caps;
+     auto kv_cache = &worker->dit_kv_cache;
+ 
++    int64_t front_cut = 0;
+     if (streaming && worker->offset == 0)
+     {
+         kv_cache->cur_len = 0;
+         worker->chunk_boundaries.clear();
+         worker->flow_cache.clear();
++
++        // Friday patch: start the segment on top of the cached prompt prefix (see cosyvoice_set_dit_prompt_prefix).
++        // The prefix covers the prompt tokens whose lookahead stays inside the prompt; the last
++        // pre_lookahead_len prompt tokens are recomputed with each segment and cut from its output.
++        bool use_prefix = false;
++        if (shared->dit_prompt_prefix && !worker->dit_building_prefix
++            && params.dit_kv_offloadable_slots == 0
++            && params.dit_kv_fixed_slots == static_cast<uint32_t>(flow.decoder.diffusion_steps))
++        {
++            const auto n_prompt_tokens = static_cast<int64_t>(prompt->flow_prompt_speech_tokens.second);
++            const auto n_prompt_frames = static_cast<int64_t>(prompt->prompt_speech_feat.shape[0]);
++            const auto lookahead = static_cast<int64_t>(flow.pre_lookahead_layer.pre_lookahead_len);
++            const auto prefix_len = (n_prompt_tokens - lookahead) * flow.token_mel_ratio;
++            if (n_prompt_tokens > lookahead + 1 && prefix_len <= n_prompt_frames
++                && prefix_len * 2 <= static_cast<int64_t>(params.dit_kv_cache_length))
++            {
++                const auto key = dit_prompt_prefix_key(prompt);
++                if (worker->dit_prefix_key != key || worker->dit_prefix_len != prefix_len)
++                {
++                    worker->dit_prefix_key = 0;
++                    worker->dit_prefix_len = 0;
++
++                    // DiT over the prompt alone: its tokens split as prompt (all but the last) + one
++                    // "new" token, mel cut to the prefix; streaming drops the lookahead tail.
++                    cosyvoice_prompt prefix_prompt = *prompt;
++                    prefix_prompt.flow_prompt_speech_tokens.second = static_cast<uint32_t>(n_prompt_tokens - 1);
++                    prefix_prompt.prompt_speech_feat.shape[0] = static_cast<uint32_t>(prefix_len);
++                    cosyvoice_generated_speech unused = {};
++                    worker->dit_building_prefix = true;
++                    const bool ok = token2wav_ext(prompt->flow_prompt_speech_tokens.first.get() + n_prompt_tokens - 1, 1,
++                        speed, &prefix_prompt, true, false, &unused);
++                    worker->dit_building_prefix = false;
++                    worker->offset = 0;
++                    worker->chunk_boundaries.clear();
++                    if (!ok || kv_cache->cur_len != prefix_len)
++                    {
++                        kv_cache->cur_len = 0;
++                        return false;
++                    }
++                    worker->dit_prefix_key = key;
++                    worker->dit_prefix_len = static_cast<uint32_t>(prefix_len);
++                }
++                kv_cache->cur_len = worker->dit_prefix_len;
++                worker->offset = worker->dit_prefix_len;
++                worker->chunk_boundaries.push_back(worker->dit_prefix_len);
++                front_cut = n_prompt_frames - prefix_len;
++                use_prefix = true;
++            }
++        }
++        if (!use_prefix && !worker->dit_building_prefix)
++        {
++            // This segment writes the DiT KV cache from position 0.
++            worker->dit_prefix_key = 0;
++            worker->dit_prefix_len = 0;
++        }
+     }
+ 
+     ggml_reset(ctx0.get());
+@@ -265,7 +343,14 @@
+         }
+     } while (false);
+ 
+-    dit_sched_config config(params, cut_len, streaming ? worker->offset : 0, streaming, kv_cache->can_reuse(), flow.decoder.diffusion_steps);
++    dit_sched_config config(params, worker->dit_building_prefix ? 0 : cut_len, streaming ? worker->offset : 0, streaming, kv_cache->can_reuse(), flow.decoder.diffusion_steps);
++    if (front_cut > 0)
++    {
++        // Friday patch: drop the recomputed prompt tail from the first chunk on top of the prefix.
++        auto& last = config.graph_config[flow.decoder.diffusion_steps - 1];
++        last.cut_len = front_cut;
++        last.rebuild = true;
++    }
+     uint32_t noise_len = static_cast<uint32_t>(ggml_nelements(ditctx.x));
+     uint32_t noise_req = noise_len;
+     int64_t full_len;
+@@ -285,6 +370,12 @@
+         const auto chunk_len = full_len - (worker->chunk_boundaries.size() > 1 ? worker->chunk_boundaries.rbegin()[1] : 0);
+         if (kv_cache->cur_len + chunk_len >= params.dit_kv_cache_length)
+             kv_cache->cur_len = params.dit_kv_cache_length - chunk_len;
++        if (kv_cache->cur_len < worker->dit_prefix_len)
++        {
++            // Friday patch: the cache wrapped into the prompt prefix; rebuild it next segment.
++            worker->dit_prefix_key = 0;
++            worker->dit_prefix_len = 0;
++        }
+     }
+     else
+         full_len = seq_len;
+@@ -452,6 +543,17 @@
+         stage_compute_after(step);
+     }
+ 
++    if (worker->dit_building_prefix)
++    {
++        // Friday patch: the prefix pass only fills the DiT KV cache; no mel / audio.
++        kv_cache->cur_len += static_cast<uint32_t>(position_ids->ne[0]);
++        ggml_reset(ctx0.get());
++        ggml_backend_sched_reset(sched.get());
++        result->data = nullptr;
++        result->length = 0;
++        return true;
++    }
++
+     // Phase 3: Copy flow output to speech_feat (persistent buffer)
+     ggml_reset(ctx1.get());
+     const auto cache_length = streaming ? static_cast<int64_t>(worker->flow_cache.size() / feat->ne[0]) : 0;
+diff --git a/src/cosyvoice.cpp b/src/cosyvoice.cpp
+--- a/src/cosyvoice.cpp
++++ b/src/cosyvoice.cpp
+@@ -505,6 +505,19 @@
+     return ctx->set_chunk_tokens(n_tokens);
+ }
+ 
++void cosyvoice_set_dit_prompt_prefix(cosyvoice_context_t ctx, bool enabled)
++{
++    if (auto model = dynamic_cast<cosyvoice_model*>(ctx))
++    {
++        model->shared->dit_prompt_prefix = enabled;
++        for (uint32_t i = 0; i != model->shared->params.n_workers; ++i)
++        {
++            model->workers[i].dit_prefix_key = 0;
++            model->workers[i].dit_prefix_len = 0;
++        }
++    }
++}
++
+ ggml_status cosyvoice_get_last_status(cosyvoice_context_t ctx)
+ {
+     return ctx->get_last_status();

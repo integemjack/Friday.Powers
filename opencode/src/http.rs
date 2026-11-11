@@ -139,11 +139,6 @@ impl<'a> Sse<'a> {
         self.chunk(format!("data: {value}\n\n").as_bytes())
     }
 
-    /// SSE 注释行（客户端忽略）：保活、探测客户端还在不在
-    pub fn comment(&mut self) -> bool {
-        self.chunk(b": ping\n\n")
-    }
-
     pub fn done(&mut self) {
         self.chunk(b"data: [DONE]\n\n");
         if self.alive {

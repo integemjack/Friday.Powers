@@ -25,7 +25,7 @@
 | 接口 | 说明 |
 |---|---|
 | `GET /health` | `{"status":"ok"}` |
-| `GET /v1/info` | 版本、连的哪个 OpenCode（`backend`）、找到的 opencode 程序、记着几段对话 |
+| `GET /v1/info` | 版本、连的哪个 OpenCode（`backend`）、找到的 opencode 程序、记着几段对话、`active`（正在跑的对话请求数：宿主停闲置的 Power 之前看它，OpenCode 一轮可能跑很久） |
 | `GET /v1/models` | OpenCode 的 `/api/model`：`id` = `服务商/模型`，`name`、`context_length`、`input_modalities`、`free`（价格都是 0）、`backend` |
 | `POST /v1/chat/completions` | OpenAI 兼容（流式 / 非流式），见下 |
 
@@ -48,7 +48,8 @@
   - `toolEvents` 时：单独一块，`delta` 为空、顶层 `x_friday.tool`：
     `{"id", "name"（OpenCode 的工具名：read / write / edit / shell / grep / glob / list / webfetch / websearch …）, "title"（中文名）,
     "summary"（路径 / 命令等，工作目录下的写成相对路径）, "input"（原样参数）, "status": "running"}`，
-    之后同一个 `id` 再来一块 `"status": "success" | "failed" | "waiting"`（等用户确认）带 `"output"`（结果全文，截到 8000 字）、`"metadata"`；
+    之后同一个 `id` 再来一块 `"status": "success" | "failed" | "waiting"`（等用户确认）带 `"output"`（结果全文，截到 8000 字）、`"metadata"`，
+    每块都带着 `name` / `title` / `summary` / `input`（放行后接着那次请求里报它做完时也带：客户端那边原来那行可能已经不在了）；
     Friday 只显示，不执行。
   - 否则写进 `reasoning_content`（`▸ 读取 numbers.txt` / `  ✓ …` / `  ✗ …`）。
 - **权限确认**：OpenCode 要问（`permission.asked`）时（`toolEvents` 时先给对应的工具发一条 `"status": "waiting"`，正文只一句），
@@ -59,6 +60,7 @@
 - 出错：还没写出任何内容时回 HTTP 错误码（OpenCode 报的 `status`，如 429 免费额度用完 / 402 余额不足），
   带 `Retry-After`（OpenCode 的 `retryAfterMs`）；已经在流了就在正文末尾写一句。
 - Friday 断开（点了停止）→ 中止 OpenCode 那次执行。15 分钟没有任何事件 → 中止、504。
+  OpenCode 没动静时每 15 秒发一块空的 `delta`（不是 SSE 注释：EDITH / Friday 的读流按数据块算没超时）。
 
 ## 3. 实现要点
 

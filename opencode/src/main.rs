@@ -131,6 +131,8 @@ fn info() -> Value {
         "error": match &backend { Ok(_) => Value::Null, Err(e) => Value::String(e.clone()) },
         "binary": backend::find_binary().map(|p| p.to_string_lossy().to_string()),
         "conversations": store::count(),
+        // 正在跑的对话请求（宿主停闲置的 Power 之前看它：OpenCode 一轮可能跑很久）
+        "active": chat::ACTIVE.load(std::sync::atomic::Ordering::SeqCst),
     })
 }
 

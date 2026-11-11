@@ -22,6 +22,9 @@ pub struct Entry {
 pub struct Pending {
     /// opencode 的权限请求 id（回复它）
     pub request: String,
+    /// 等确认的那个工具（结构化事件里的 {id, name, title, summary, input}）：放行后接着那次请求报它做完时带上名字和参数
+    /// （客户端那边原来那行可能已经不在了：重开过、远程的存档里那一轮已经结束）
+    pub tool: Option<serde_json::Value>,
 }
 
 struct Store {

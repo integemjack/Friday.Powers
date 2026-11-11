@@ -477,8 +477,8 @@ impl<'a> Out<'a> {
 
     fn ping(&mut self) {
         if let Some(sse) = self.sse.as_mut() {
-            // SSE 注释行：保活，也顺便发现客户端走了
-            if !sse.comment() {
+            // 空的数据块（不是注释行）：保活、发现客户端走了；EDITH 只在收到数据时才看要不要停，OpenCode 安静时点停止也能马上停
+            if !sse.data(&chunk(&self.model, json!({}), None, None)) {
                 self.gone = true;
             }
         }
@@ -489,7 +489,24 @@ impl<'a> Out<'a> {
     }
 }
 
+/// 正在跑的对话请求有几个（/v1/info 的 active：宿主据此不把在干活的桥当成闲置停掉）
+pub static ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct ActiveGuard;
+impl ActiveGuard {
+    fn new() -> Self {
+        ACTIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ActiveGuard
+    }
+}
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 pub fn handle(req: &Request, stream: &mut TcpStream) {
+    let _active = ActiveGuard::new();
     let body: Value = match serde_json::from_slice(&req.body) {
         Ok(v) => v,
         Err(e) => {
@@ -548,8 +565,10 @@ fn run(be: &Backend, ask: &Ask, stream: &mut TcpStream, streaming: bool) -> Resu
     let result = (|| -> Result<(), String> {
         // 上一句停在权限确认上：这句是「允许」就放行接着收，否则拒掉再按新的话做
         let mut resumed = false;
+        let mut carried = None;
         if !ask.key.is_empty() {
             if let Some(p) = store::pending(&ask.key) {
+                carried = p.tool.clone();
                 store::set_pending(&ask.key, None);
                 let decision = approval(&ask.said).unwrap_or("reject");
                 let reply = oc::post(&be.conn, &format!("/api/session/{sid}/permission/{}/reply", p.request), dir, &json!({ "decision": decision }));
@@ -580,7 +599,7 @@ fn run(be: &Backend, ask: &Ask, stream: &mut TcpStream, streaming: bool) -> Resu
             }
             oc::ok(oc::post(&be.conn, &format!("/api/session/{sid}/prompt"), dir, &prompt), "发给 opencode")?;
         }
-        pump(be, ask, &sid, &rx, stream, streaming)
+        pump(be, ask, &sid, &rx, stream, streaming, if resumed { carried } else { None })
     })();
     bus.unsubscribe(&sid);
     if ask.key.is_empty() {
@@ -589,11 +608,35 @@ fn run(be: &Backend, ask: &Ask, stream: &mut TcpStream, streaming: bool) -> Resu
     result
 }
 
-fn pump(be: &Backend, ask: &Ask, sid: &str, rx: &std::sync::mpsc::Receiver<Value>, stream: &mut TcpStream, streaming: bool) -> Result<(), String> {
+/// carried：放行的那个等确认的工具（上一次请求里报过开始），这次报它做完时带上它的名字和参数
+fn pump(
+    be: &Backend,
+    ask: &Ask,
+    sid: &str,
+    rx: &std::sync::mpsc::Receiver<Value>,
+    stream: &mut TcpStream,
+    streaming: bool,
+    carried: Option<Value>,
+) -> Result<(), String> {
     let dir = Some(ask.dir.as_str());
     let mut out = Out { stream: Some(stream), sse: None, streaming, model: ask.model.clone(), content: String::new(), reasoning: String::new(), gone: false, tools: 0 };
     let structured = ask.tool_events && streaming;
     let mut names: std::collections::HashMap<String, String> = Default::default();
+    // 这次（和放行的那个）报过开始的工具：id → {id, name, title, summary, input}；之后的状态都带上这几项
+    let mut called: std::collections::HashMap<String, Value> = Default::default();
+    if let Some(tool) = carried {
+        if let Some(id) = tool["id"].as_str() {
+            names.insert(id.to_string(), tool["name"].as_str().unwrap_or("").to_string());
+            called.insert(id.to_string(), tool.clone());
+        }
+    }
+    let update = |called: &std::collections::HashMap<String, Value>, id: &str, name: &str, extra: Value| -> Value {
+        let mut tool = called.get(id).cloned().unwrap_or_else(|| json!({ "id": id, "name": name, "title": tool_label(name) }));
+        for (key, value) in extra.as_object().cloned().unwrap_or_default() {
+            tool[key] = value;
+        }
+        tool
+    };
     let mut usage = Usage::default();
     let mut failure: Option<Failure> = None;
     let mut last_event = Instant::now();
@@ -637,7 +680,9 @@ fn pump(be: &Backend, ask: &Ask, sid: &str, rx: &std::sync::mpsc::Receiver<Value
                 let name = names.get(&id).cloned().unwrap_or_default();
                 let arg = tool_arg(&d["input"], &ask.dir);
                 if structured {
-                    out.tool(json!({ "id": id, "name": name, "title": tool_label(&name), "summary": arg, "input": relative(&d["input"], &ask.dir), "status": "running" }));
+                    let tool = json!({ "id": id, "name": name, "title": tool_label(&name), "summary": arg, "input": relative(&d["input"], &ask.dir) });
+                    called.insert(id.clone(), tool.clone());
+                    out.tool(update(&called, &id, &name, json!({ "status": "running" })));
                 } else {
                     out.emit(json!({ "reasoning_content": format!("\n▸ {} {}\n", tool_label(&name), arg) }));
                 }
@@ -646,7 +691,7 @@ fn pump(be: &Backend, ask: &Ask, sid: &str, rx: &std::sync::mpsc::Receiver<Value
                 if structured {
                     let id = d["id"].as_str().unwrap_or("").to_string();
                     let name = names.get(&id).cloned().unwrap_or_default();
-                    out.tool(json!({ "id": id, "name": name, "status": "success", "output": cut(&full_text(&d["content"]), 8000), "metadata": d["metadata"] }));
+                    out.tool(update(&called, &id, &name, json!({ "status": "success", "output": cut(&full_text(&d["content"]), 8000), "metadata": d["metadata"] })));
                 } else {
                     let line = first_line(&d["content"]);
                     out.emit(json!({ "reasoning_content": if line.is_empty() { "  ✓\n".to_string() } else { format!("  ✓ {line}\n") } }));
@@ -657,7 +702,7 @@ fn pump(be: &Backend, ask: &Ask, sid: &str, rx: &std::sync::mpsc::Receiver<Value
                 if structured {
                     let id = d["id"].as_str().unwrap_or("").to_string();
                     let name = names.get(&id).cloned().unwrap_or_default();
-                    out.tool(json!({ "id": id, "name": name, "status": "failed", "output": cut(msg, 2000) }));
+                    out.tool(update(&called, &id, &name, json!({ "status": "failed", "output": cut(msg, 2000) })));
                 } else {
                     out.emit(json!({ "reasoning_content": format!("  ✗ {}\n", cut(msg, 160)) }));
                 }
@@ -672,10 +717,10 @@ fn pump(be: &Backend, ask: &Ask, sid: &str, rx: &std::sync::mpsc::Receiver<Value
                     continue;
                 }
                 // 对应的工具行标成「等确认」（不然一直显示运行中）
-                if structured {
-                    if let Some(call) = d["source"]["id"].as_str() {
-                        out.tool(json!({ "id": call, "status": "waiting", "output": format!("等你确认：{}", permission_label(&action)) }));
-                    }
+                let call = d["source"]["id"].as_str().unwrap_or("").to_string();
+                if structured && !call.is_empty() {
+                    let name = names.get(&call).cloned().unwrap_or_default();
+                    out.tool(update(&called, &call, &name, json!({ "status": "waiting", "output": format!("等你确认：{}", permission_label(&action)) })));
                 }
                 let list = resources.iter().map(|r| cut(r, 300)).collect::<Vec<_>>().join("\n");
                 if structured {
@@ -689,7 +734,7 @@ fn pump(be: &Backend, ask: &Ask, sid: &str, rx: &std::sync::mpsc::Receiver<Value
                         permission_label(&action), list) }));
                 }
                 backend::log(&format!("permission asked {request} action={action} session={sid}"));
-                store::set_pending(&ask.key, Some(store::Pending { request }));
+                store::set_pending(&ask.key, Some(store::Pending { request, tool: called.get(&call).cloned() }));
                 waiting_permission = true;
                 break;
             }

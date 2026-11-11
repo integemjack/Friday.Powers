@@ -30,6 +30,10 @@ LICENSES = {
 
 
 def version(power: Path, executable: str):
+    # Rust 写的（opencode）：版本在 Cargo.toml 的 [package]
+    cargo = power / "Cargo.toml"
+    if cargo.exists():
+        return re.search(r'(?m)^version\s*=\s*"([0-9.]+)"', cargo.read_text(encoding="utf-8")).group(1)
     text = (power / "CMakeLists.txt").read_text(encoding="utf-8")
     return re.search(r"project\(" + re.escape(executable) + r" VERSION ([0-9.]+)", text).group(1)
 
@@ -64,6 +68,9 @@ def main():
     stage.mkdir(parents=True)
 
     exe = build / "bin" / (executable + ".exe" if windows else executable)
+    if not exe.exists():
+        # cargo 的产物直接在 target/<平台>/release/ 下
+        exe = build / (executable + ".exe" if windows else executable)
     shutil.copy2(exe, stage / exe.name)
     for extra in args.extra:
         shutil.copy2(extra, stage / Path(extra).name)

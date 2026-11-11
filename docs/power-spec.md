@@ -110,6 +110,7 @@ schema 2 的清单多两个字段：`library`（`{format: "gguf", kinds: ["text"
 | `realtimeSpeech` | `GET /v1/realtime/speak`（WebSocket） | 边写边读：文字流进去、音频流出来，可打断，见 `voice-protocol.md` |
 | `chat` | `POST /v1/chat/completions`（OpenAI 兼容 + `x_friday`） | 本地大模型（llm），多并发 + 基数树前缀共享，见 `llm-protocol.md` |
 | `imageGeneration` / `videoGeneration` | `POST /v1/jobs`、`POST /v1/images/generations` | 本地生图 / 生视频（diffusion），见 `diffusion-protocol.md` |
+| `agentChat` | `GET /v1/models`、`POST /v1/chat/completions`（OpenAI 兼容 + `x_friday`） | 本机的 OpenCode：交给 OpenCode 自己的智能体做（opencode），见 `opencode-protocol.md` |
 
 吃显存的 Power（llm、diffusion）另有 `POST /v1/memory/release`：卸载模型、腾显存。llm 还有 `POST /v1/memory/reserve`：给别的程序留显存（Friday 生图 / 生视频前让 llm 留出地方，见 [llm-protocol.md](llm-protocol.md) §1.1）。
 

@@ -1,0 +1,87 @@
+# friday-opencode（Rust）：各平台编译、打包、跑一遍自检；推 opencode-vX.Y.Z 标签时发 Release 并更新 index Release 里的索引（index-v2.json）。
+# 不用 GPU：只出通用的 macos-arm64、windows-x64、linux-x64、linux-arm64（Friday 的 Swift 版 2.97 起认 macos-arm64，Qt 版本来就认 <系统>-<架构>）。
+name: opencode
+
+on:
+  push:
+    branches: [main]
+    tags: ['opencode-v*']
+    paths: ['opencode/**', 'ci/**', '.github/workflows/opencode.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: opencode-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macos-arm64
+            runner: macos-15
+            triple: aarch64-apple-darwin
+          - target: windows-x64
+            runner: windows-2022
+            triple: x86_64-pc-windows-msvc
+          # ubuntu-22.04：glibc 2.35，老一点的发行版也能跑
+          - target: linux-x64
+            runner: ubuntu-22.04
+            triple: x86_64-unknown-linux-gnu
+          - target: linux-arm64
+            runner: ubuntu-22.04-arm
+            triple: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v7
+      - name: 装 Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.triple }}
+          rustup default stable
+      - name: 编译
+        shell: bash
+        working-directory: opencode
+        run: cargo build --release --locked --target ${{ matrix.triple }} || cargo build --release --target ${{ matrix.triple }}
+      - name: 自检（版本、没有 opencode 时的 info）
+        shell: bash
+        run: |
+          exe=opencode/target/${{ matrix.triple }}/release/friday-opencode
+          [ -f "$exe.exe" ] && exe="$exe.exe"
+          "$exe" --version
+          "$exe" info
+      - name: 打包
+        shell: bash
+        run: |
+          PY=python3; command -v python3 >/dev/null 2>&1 || PY=python
+          $PY ci/package.py --power opencode --target ${{ matrix.target }} --build opencode/target/${{ matrix.triple }}/release --out dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: dist/opencode-*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/opencode-v')
+    needs: [build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: 发布
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/opencode-*.zip dist/opencode-*.tar.gz --title "$TAG" \
+            --notes "friday-opencode ${TAG#opencode-v}：把本机的 OpenCode 接进 Friday（模型菜单「OpenCode」，交给 OpenCode 自己的智能体做，内容实时返回）。各平台包见附件，Friday 2.97 起通过 index 里的 index-v2.json 按需下载。" \
+            || gh release upload "$TAG" dist/opencode-*.zip dist/opencode-*.tar.gz --clobber
+          python3 ci/publish_index.py --power opencode --dist dist --tag "$TAG" --repo "$GITHUB_REPOSITORY"

@@ -1,0 +1,29 @@
+{
+  "schema": 2,
+  "id": "opencode",
+  "title": "OpenCode",
+  "detail": "把本机的 OpenCode（opencode.ai 的编程智能体）接进来：模型菜单里多一组「OpenCode」，列出你在 OpenCode 里能用的模型（登录的服务商、免费模型）。选了它的对话交给 OpenCode 自己的智能体在这段对话的工作目录里读写文件、跑命令，内容实时显示；要权限时在对话里问你（按会话框下的权限档：自动 = 读写文件不问、跑命令先问，计划 = 只读，完全 = 都不问）。要先装 OpenCode 桌面版或命令行版，服务商在 OpenCode 里登录。",
+  "executable": "friday-opencode",
+  "serve": [
+    "serve",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "0",
+    "--data-dir",
+    "{models}",
+    "--token",
+    "{token}",
+    "--parent-stdin"
+  ],
+  "capabilities": [
+    "agentChat"
+  ],
+  "models": [],
+  "targets": {
+    "macos-arm64": { "detail": "Apple 芯片的 Mac" },
+    "windows-x64": { "detail": "Windows x64" },
+    "linux-x64": { "detail": "Linux x64" },
+    "linux-arm64": { "detail": "Linux ARM64" }
+  }
+}

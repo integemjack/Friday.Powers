@@ -1,0 +1,23 @@
+[package]
+name = "friday-opencode"
+version = "0.1.0"
+edition = "2021"
+description = "Friday 的 opencode 能力：把本机 opencode 自己的智能体接成 OpenAI 兼容的流式接口"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "friday-opencode"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+sha2 = "0.10"
+base64 = "0.23"
+# 只连本机的 opencode（http://127.0.0.1），不要 TLS / 压缩
+ureq = { version = "3", default-features = false }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "debuginfo"

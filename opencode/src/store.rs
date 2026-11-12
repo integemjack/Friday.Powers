@@ -1,5 +1,5 @@
 //! Friday 的一段对话 → opencode 的一个会话（存在 <data-dir>/sessions.json，重启后接着用同一个会话，opencode 记得前面聊过的）；
-//! 以及停在「等用户确认权限」的会话（只在内存里：opencode 重启了那个请求也就没了）。
+//! 以及停在「等用户确认权限 / 等用户回答提问」的会话（只在内存里；本程序重启后丢了，下一句话进来时再问 opencode 这个会话有没有在等的，见 chat.rs）。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -20,11 +20,13 @@ pub struct Entry {
 
 #[derive(Clone, Debug)]
 pub struct Pending {
-    /// opencode 的权限请求 id（回复它）
+    /// opencode 的权限请求 id（回复它）；提问时是表单 id（frm_…）
     pub request: String,
     /// 等确认的那个工具（结构化事件里的 {id, name, title, summary, input}）：放行后接着那次请求报它做完时带上名字和参数
     /// （客户端那边原来那行可能已经不在了：重开过、远程的存档里那一轮已经结束）
     pub tool: Option<serde_json::Value>,
+    /// 提问（opencode 的 question 工具建的表单 form.created 的 form：{id, title, metadata, fields}）；None = 权限确认
+    pub form: Option<serde_json::Value>,
 }
 
 struct Store {

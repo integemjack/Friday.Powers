@@ -475,15 +475,36 @@ pub fn reaper() {
     }
 }
 
-/// 本程序要退了：停掉所有 claude
+/// 本程序要退了：停掉所有 claude（先 SIGTERM；停在等确认 / 等回答上的要几秒才退完，最多等 3 秒，还在的整组 SIGKILL）
 pub fn shutdown() {
     let convs: Vec<Arc<Conv>> = registry().lock().unwrap().values().cloned().collect();
+    let mut pids = Vec::new();
     for c in convs {
         let pid = c.pid.swap(0, Ordering::SeqCst);
         if pid != 0 {
             terminate(pid);
+            pids.push(pid);
         }
     }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !pids.is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        pids.retain(|pid| alive(*pid));
+    }
+    for pid in pids {
+        kill_hard(pid);
+    }
+}
+
+#[cfg(unix)]
+fn alive(pid: u32) -> bool {
+    // SAFETY: 信号 0 只查进程在不在
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn alive(_pid: u32) -> bool {
+    false
 }
 
 const EDITS: [&str; 4] = ["Edit", "Write", "MultiEdit", "NotebookEdit"];

@@ -7,6 +7,7 @@
 //!   cwd         工作目录（claude 在这里读写、跑命令）；没有就用本程序的数据目录下的 work
 //!   permission  Friday 会话框下的权限档：auto（默认：改工作目录里的文件不问，跑命令等先问）| plan（只读）| full（都不问）
 //!   toolEvents  Friday 认结构化的工具事件（x_friday.tool）
+//!   questions   Friday 把等回答的提问行（AskUserQuestion）画成选项卡片（v2.97.25 起）：提问时正文不再列一遍问题
 //! 要用户确认的操作：这次回答以一句说明结束，claude 那边停着等；用户下一句说「允许」/「总是允许」就放行并接着把后面的内容流回来，
 //! 说别的就拒绝、再把这句话当成新的一句交给它。
 
@@ -41,6 +42,8 @@ struct Ask {
     /// 这段对话之前的内容（新开 Claude Code 会话时带上）
     history: String,
     tool_events: bool,
+    /// Friday 把等回答的提问行画成选项卡片（x_friday.questions）
+    questions: bool,
 }
 
 fn text_of(content: &Value) -> String {
@@ -139,6 +142,7 @@ fn parse(body: &Value) -> Result<Ask, String> {
     }
     .to_string();
     let tool_events = xf["toolEvents"].as_bool().unwrap_or(false);
+    let questions = xf["questions"].as_bool().unwrap_or(false);
     let messages: Vec<Value> = body["messages"].as_array().cloned().unwrap_or_default();
     let Some(last_user) = messages.iter().rposition(|m| m["role"].as_str() == Some("user")) else {
         return Err("messages 里没有用户的话".into());
@@ -180,7 +184,7 @@ fn parse(body: &Value) -> Result<Ask, String> {
     if text.trim().is_empty() && images.is_empty() {
         return Err("最后一句用户的话是空的".into());
     }
-    Ok(Ask { model, key, dir, permission, text, said, images, history, tool_events })
+    Ok(Ask { model, key, dir, permission, text, said, images, history, tool_events, questions })
 }
 
 fn content(text: &str, images: &[Value]) -> Value {
@@ -757,8 +761,11 @@ fn conversation(bin: &Path, ask: &Ask, out: &mut Out) -> Pumped {
 fn answer(conv: &Conv, p: &mut Proc, ask: &Ask, pending: Pending) -> Result<(), String> {
     let words = own_words(&ask.said).to_string();
     if pending.tool == "AskUserQuestion" {
-        let _ = pending.reply.send(conv::deny_json(&format!("用户在 Friday 里直接用文字回答了：{words}")));
-        backend::log(&format!("question {} → 用户回答了", pending.id));
+        // 放行并带上回答（同 Agent SDK 的做法：updatedInput.answers = {问题: 选的选项名}），它的提问工具照常成功
+        let mut input = if pending.input.is_object() { pending.input.clone() } else { json!({}) };
+        input["answers"] = question_answers(&pending.input, &words);
+        backend::log(&format!("question {} → {}", pending.id, input["answers"]));
+        let _ = pending.reply.send(conv::allow_json(&input));
         return Ok(());
     }
     match approval(&ask.said) {
@@ -1131,7 +1138,10 @@ fn ask_user(conv: &Conv, p: &mut Proc, ask: &Ask, out: &mut Out, structured: boo
         let note = if question { "等你回答".to_string() } else { format!("等你确认：{}", permission_label(&tool)) };
         out.tool(with(&base, json!({ "status": "waiting", "output": note })));
     }
-    let text = if question {
+    let text = if question && structured && ask.questions {
+        // Friday 把这一行画成选项卡片，正文不再列一遍
+        String::new()
+    } else if question {
         let mut t = String::from("\n\n");
         for q in input["questions"].as_array().into_iter().flatten() {
             t.push_str(&format!("**{}**\n", q["question"].as_str().unwrap_or("")));
@@ -1144,7 +1154,11 @@ fn ask_user(conv: &Conv, p: &mut Proc, ask: &Ask, out: &mut Out, structured: boo
             }
             t.push('\n');
         }
-        t.push_str("（Claude Code 在问你：直接回复你的选择或想法。）");
+        if input["questions"].as_array().map(Vec::len).unwrap_or(0) > 1 {
+            t.push_str("（Claude Code 在问你：回复选项的名字或序号，几题之间用「；」隔开；也可以直接说你的想法。）");
+        } else {
+            t.push_str("（Claude Code 在问你：回复选项的名字或序号，也可以直接说你的想法。）");
+        }
         t
     } else if structured {
         format!(
@@ -1162,7 +1176,9 @@ fn ask_user(conv: &Conv, p: &mut Proc, ask: &Ask, out: &mut Out, structured: boo
             detail
         )
     };
-    out.emit(json!({ "content": text }));
+    if !text.is_empty() {
+        out.emit(json!({ "content": text }));
+    }
     backend::log(&format!("permission asked key={} id={id} tool={tool}", conv::short(&conv.key)));
     true
 }
@@ -1257,5 +1273,95 @@ mod tests {
         let parts = json!([{ "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,QUJD" } }, { "type": "text", "text": "看图" }]);
         let images = images_of(&parts);
         assert_eq!(images, vec![json!({ "type": "image", "source": { "type": "base64", "media_type": "image/jpeg", "data": "QUJD" } })]);
+    }
+}
+
+/// 用户对 AskUserQuestion 的回答 → updatedInput.answers（{问题: 选的选项名}，多选用「, 」连起来，选项外的原样）。
+/// 几题时按「；」拆成每题一段（段数对不上就整句当每一题的回答）；「（跳过）」/ 空 = 这题不答
+fn question_answers(input: &Value, said: &str) -> Value {
+    let questions: Vec<&Value> = input["questions"].as_array().into_iter().flatten().collect();
+    let said = said.trim();
+    let parts: Vec<&str> = if questions.len() > 1 {
+        let parts: Vec<&str> = said.split(['；', ';', '\n']).map(str::trim).collect();
+        if parts.len() == questions.len() {
+            parts
+        } else {
+            vec![said; questions.len()]
+        }
+    } else {
+        vec![said]
+    };
+    let mut answers = serde_json::Map::new();
+    for (q, part) in questions.iter().zip(parts) {
+        let Some(question) = q["question"].as_str() else { continue };
+        let part = part.trim().trim_end_matches(['。', '.', '！', '!']);
+        if part.is_empty() || part == "（跳过）" || part == "跳过" {
+            continue;
+        }
+        let labels: Vec<&str> = q["options"].as_array().into_iter().flatten().filter_map(|o| o["label"].as_str()).collect();
+        let value = if q["multiSelect"].as_bool() == Some(true) {
+            let items: Vec<&str> = part.split(['、', ',', '，']).map(str::trim).filter(|s| !s.is_empty()).collect();
+            let matched: Vec<&str> = items.iter().filter_map(|i| match_label(&labels, i)).collect();
+            if !items.is_empty() && matched.len() == items.len() {
+                matched.join(", ")
+            } else {
+                match_label(&labels, part).unwrap_or(part).to_string()
+            }
+        } else {
+            match_label(&labels, part).unwrap_or(part).to_string()
+        };
+        answers.insert(question.to_string(), Value::String(value));
+    }
+    Value::Object(answers)
+}
+
+/// 一段回答对上哪个选项名：名字（不分大小写，也认去掉「(Recommended)」「（推荐）」的）、或序号「2」「第二个」「选 2」
+fn match_label<'a>(labels: &[&'a str], text: &str) -> Option<&'a str> {
+    fn bare(s: &str) -> String {
+        let mut s = s.trim().to_lowercase();
+        for tag in ["(recommended)", "（推荐）", "(推荐)", "【推荐】"] {
+            if let Some(stripped) = s.strip_suffix(tag) {
+                s = stripped.trim().to_string();
+            }
+        }
+        s
+    }
+    let t = bare(text);
+    if t.is_empty() {
+        return None;
+    }
+    if let Some(l) = labels.iter().find(|l| bare(l) == t) {
+        return Some(l);
+    }
+    let n = t.trim_start_matches(['选', '第']).trim().trim_end_matches(['个', '项', '号', '.', '、', ')', '）']).trim();
+    let index = match n {
+        "一" => Some(1),
+        "二" | "两" => Some(2),
+        "三" => Some(3),
+        "四" => Some(4),
+        _ => n.parse::<usize>().ok(),
+    }?;
+    labels.get(index.checked_sub(1)?).copied()
+}
+
+#[cfg(test)]
+mod question_tests {
+    use super::*;
+
+    fn input() -> Value {
+        json!({ "questions": [
+            { "question": "用哪种语言？", "header": "语言", "multiSelect": false,
+              "options": [{ "label": "Rust (Recommended)", "description": "快" }, { "label": "Python", "description": "简单" }] },
+            { "question": "要哪些附件？", "header": "附件", "multiSelect": true,
+              "options": [{ "label": "表格" }, { "label": "图表" }, { "label": "摘要" }] }
+        ]})
+    }
+
+    #[test]
+    fn answers_by_label_number_and_free_text() {
+        assert_eq!(question_answers(&input(), "rust；1、3"), json!({ "用哪种语言？": "Rust (Recommended)", "要哪些附件？": "表格, 摘要" }));
+        assert_eq!(question_answers(&input(), "2；图表"), json!({ "用哪种语言？": "Python", "要哪些附件？": "图表" }));
+        assert_eq!(question_answers(&input(), "随你"), json!({ "用哪种语言？": "随你", "要哪些附件？": "随你" }));
+        assert_eq!(question_answers(&input(), "Python；（跳过）"), json!({ "用哪种语言？": "Python" }));
     }
 }

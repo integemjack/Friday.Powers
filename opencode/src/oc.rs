@@ -216,7 +216,13 @@ pub fn bus(conn: &Conn, dir: &str) -> Result<Arc<Bus>, String> {
     let b = bus.clone();
     std::thread::spawn(move || {
         while let Some(event) = events.next() {
-            let session = event.pointer("/data/sessionID").and_then(Value::as_str).unwrap_or("").to_string();
+            // 提问的表单事件（form.created）会话 id 在 data.form.sessionID 里
+            let session = event
+                .pointer("/data/sessionID")
+                .or_else(|| event.pointer("/data/form/sessionID"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             if session.is_empty() {
                 continue;
             }

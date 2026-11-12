@@ -6,8 +6,12 @@
 //!   session     这段对话（或子智能体）的标识：同一个值 → 同一个 opencode 会话（opencode 记得前面聊过的）；没有 = 一次性的辅助请求
 //!   cwd         工作目录（opencode 在这里读写、跑命令）；没有就用本程序的数据目录下的 work
 //!   permission  Friday 会话框下的权限档：auto（默认：读写工作目录里的文件不问，跑命令等先问）| plan（只读）| full（都不问）
+//!   questions   Friday 会把等回答的提问行画成选项卡片（v2.97.25 起）：提问时正文不再列一遍问题
 //! 要用户确认的操作（opencode 的 permission.asked）：这次回答以一段说明结束，opencode 那边停着等；用户下一句说「允许」/「总是允许」
 //! 就放行并接着把后面的内容流回来，说别的就拒绝、再按新的话做。
+//! 提问（opencode 的 question 工具建一张表单 form.created，一直等到有人回答）：提问那一行标成等回答、这次回答到此结束；
+//! 用户下一句话就是回答——几题用「；」隔开、选项写名字或序号，填进表单（POST …/form/<id>/reply），opencode 接着做；
+//! 填不进去（选项外的回答而这题不许自己写）就取消提问、按新的话做。
 
 use std::net::TcpStream;
 use std::sync::mpsc::RecvTimeoutError;
@@ -37,6 +41,8 @@ struct Ask {
     history: String,
     /// Friday 认结构化的工具事件（x_friday.toolEvents）：工具活动发成 x_friday.tool，画成原生工具行；否则写进思考区
     tool_events: bool,
+    /// Friday 把等回答的提问行画成选项卡片（x_friday.questions）：提问时正文不再列问题
+    questions: bool,
 }
 
 fn text_of(content: &Value) -> String {
@@ -133,6 +139,7 @@ fn parse(body: &Value) -> Result<Ask, String> {
     let session = xf["session"].as_str().unwrap_or("").to_string();
     let permission = xf["permission"].as_str().unwrap_or("auto").to_string();
     let tool_events = xf["toolEvents"].as_bool().unwrap_or(false);
+    let questions = xf["questions"].as_bool().unwrap_or(false);
     let messages: Vec<Value> = body["messages"].as_array().cloned().unwrap_or_default();
     let last_user = messages.iter().rposition(|m| m["role"].as_str() == Some("user"));
     let Some(last_user) = last_user else { return Err("messages 里没有用户的话".into()) };
@@ -170,7 +177,7 @@ fn parse(body: &Value) -> Result<Ask, String> {
     } else {
         (said.clone(), tail(&transcript(before), 12000))
     };
-    Ok(Ask { provider, model_id, model, key, dir, permission, text, said, files, history, tool_events })
+    Ok(Ask { provider, model_id, model, key, dir, permission, text, said, files, history, tool_events, questions })
 }
 
 fn rule(action: &str, effect: &str) -> Value {
@@ -260,11 +267,14 @@ fn ensure_session(be: &Backend, ask: &Ask) -> Result<(String, bool), String> {
     Ok((id, true))
 }
 
+/// Friday 在用户的话后面附了「（发出时间：…）」（v2.92）：只看前面用户自己说的
+fn own_words(said: &str) -> &str {
+    said.split("\n\n（发出时间").next().unwrap_or(said).trim()
+}
+
 /// 用户这句话是不是在回答权限确认：Some("once" | "always")；不是返回 None（= 拒绝，按新的话做）
 fn approval(said: &str) -> Option<&'static str> {
-    // Friday 在用户的话后面附了「（发出时间：…）」（v2.92）：只看前面用户自己说的
-    let said = said.split("\n\n（发出时间").next().unwrap_or(said);
-    let t = said.trim().trim_end_matches(['。', '！', '!', '.', '，', ',']).to_lowercase();
+    let t = own_words(said).trim_end_matches(['。', '！', '!', '.', '，', ',']).to_lowercase();
     if t.chars().count() > 12 {
         return None;
     }
@@ -567,7 +577,34 @@ fn run(be: &Backend, ask: &Ask, stream: &mut TcpStream, streaming: bool) -> Resu
         let mut resumed = false;
         let mut carried = None;
         if !ask.key.is_empty() {
-            if let Some(p) = store::pending(&ask.key) {
+            // 内存里没记着（本程序闲置被停过、重启了）：问 opencode 这个会话还有没有在等的提问 / 确认
+            let pending = store::pending(&ask.key).or_else(|| waiting_in_opencode(be, &sid, dir));
+            if let Some(p) = pending.as_ref().filter(|p| p.form.is_some()) {
+                // 上一句停在提问上：这句话就是回答
+                carried = p.tool.clone();
+                store::set_pending(&ask.key, None);
+                let form = p.form.as_ref().unwrap();
+                let answer = form_answer(form, own_words(&ask.said));
+                let reply = match &answer {
+                    Some(a) => oc::post(&be.conn, &format!("/api/session/{sid}/form/{}/reply", p.request), dir, &json!({ "answer": a })),
+                    None => Err("回答对不上表单（选项外的回答，而这题不许自己写）".to_string()),
+                };
+                let replied = matches!(reply, Ok((s, _)) if (200..300).contains(&s));
+                backend::log(&format!(
+                    "form {} → {}（{}）",
+                    p.request,
+                    answer.as_ref().map(|a| a.to_string()).unwrap_or_default(),
+                    match &reply { Ok((s, _)) => format!("HTTP {s}"), Err(e) => e.clone() }
+                ));
+                if replied {
+                    resumed = true;
+                } else {
+                    // 填不进去：取消提问、停下这次执行，再把这句话当新的话发
+                    let _ = oc::delete(&be.conn, &format!("/api/session/{sid}/form/{}", p.request), dir);
+                    let _ = oc::post(&be.conn, &format!("/api/session/{sid}/interrupt"), dir, &json!({}));
+                    wait_stopped(&rx);
+                }
+            } else if let Some(p) = pending {
                 carried = p.tool.clone();
                 store::set_pending(&ask.key, None);
                 let decision = approval(&ask.said).unwrap_or("reject");
@@ -577,14 +614,8 @@ fn run(be: &Backend, ask: &Ask, stream: &mut TcpStream, streaming: bool) -> Resu
                 if decision != "reject" && replied {
                     resumed = true;
                 } else if replied {
-                    // 拒掉后 opencode 会中止这次执行：等它停下再发新的话（最多 5 秒）
-                    let deadline = Instant::now() + Duration::from_secs(5);
-                    while Instant::now() < deadline {
-                        match rx.recv_timeout(Duration::from_millis(200)) {
-                            Ok(e) if e["type"].as_str().map(|t| t.starts_with("session.execution.") && t != "session.execution.started").unwrap_or(false) => break,
-                            _ => {}
-                        }
-                    }
+                    // 拒掉后 opencode 会中止这次执行：等它停下再发新的话
+                    wait_stopped(&rx);
                 }
             }
         }
@@ -734,7 +765,30 @@ fn pump(
                         permission_label(&action), list) }));
                 }
                 backend::log(&format!("permission asked {request} action={action} session={sid}"));
-                store::set_pending(&ask.key, Some(store::Pending { request, tool: called.get(&call).cloned() }));
+                store::set_pending(&ask.key, Some(store::Pending { request, tool: called.get(&call).cloned(), form: None }));
+                waiting_permission = true;
+                break;
+            }
+            "form.created" => {
+                let form = d["form"].clone();
+                let form_id = form["id"].as_str().unwrap_or("").to_string();
+                if ask.key.is_empty() {
+                    // 一次性请求不该问：取消
+                    let _ = oc::delete(&be.conn, &format!("/api/session/{sid}/form/{form_id}"), dir);
+                    continue;
+                }
+                // 提问那一行标成等回答（Friday 认 questions 时就地画成选项卡片）
+                let call = form["metadata"]["tool"]["id"].as_str().unwrap_or("").to_string();
+                if structured && !call.is_empty() {
+                    let name = names.get(&call).cloned().filter(|n| !n.is_empty()).unwrap_or_else(|| "question".to_string());
+                    out.tool(update(&called, &call, &name, json!({ "status": "waiting", "output": "等你回答" })));
+                }
+                if !(structured && ask.questions) {
+                    out.emit(json!({ "content": form_text(&form) }));
+                }
+                backend::log(&format!("form asked {form_id} fields={} session={sid}", form["fields"].as_array().map(Vec::len).unwrap_or(0)));
+                let tool = called.get(&call).cloned().or_else(|| (!call.is_empty()).then(|| json!({ "id": call, "name": "question", "title": tool_label("question") })));
+                store::set_pending(&ask.key, Some(store::Pending { request: form_id, tool, form: Some(form) }));
                 waiting_permission = true;
                 break;
             }
@@ -812,4 +866,215 @@ fn pump(
         );
     }
     Ok(())
+}
+
+/// 拒掉确认 / 取消提问后 opencode 会停下这次执行：等它停下再发新的话（最多 5 秒）
+fn wait_stopped(rx: &std::sync::mpsc::Receiver<Value>) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(e) if e["type"].as_str().map(|t| t.starts_with("session.execution.") && t != "session.execution.started").unwrap_or(false) => break,
+            _ => {}
+        }
+    }
+}
+
+/// 这段对话在 opencode 那边有没有还在等的提问（表单）或权限确认（本程序重启过、内存里没记着时用）
+fn waiting_in_opencode(be: &Backend, sid: &str, dir: Option<&str>) -> Option<store::Pending> {
+    let pending = |item: &Value| item["state"]["status"].as_str().map(|s| s == "pending").unwrap_or(true) && item["id"].as_str().is_some();
+    if let Ok((200, v)) = oc::get(&be.conn, &format!("/api/session/{sid}/form"), dir) {
+        if let Some(form) = v["data"].as_array().into_iter().flatten().find(|f| pending(f)) {
+            let call = form["metadata"]["tool"]["id"].as_str().unwrap_or("");
+            let tool = (!call.is_empty()).then(|| json!({ "id": call, "name": "question", "title": tool_label("question") }));
+            backend::log(&format!("session {sid} 还有没答的提问 {}", form["id"].as_str().unwrap_or("")));
+            return Some(store::Pending { request: form["id"].as_str().unwrap_or("").to_string(), tool, form: Some(form.clone()) });
+        }
+    }
+    if let Ok((200, v)) = oc::get(&be.conn, &format!("/api/session/{sid}/permission"), dir) {
+        if let Some(r) = v["data"].as_array().into_iter().flatten().find(|r| pending(r)) {
+            backend::log(&format!("session {sid} 还有没确认的权限请求 {}", r["id"].as_str().unwrap_or("")));
+            return Some(store::Pending { request: r["id"].as_str().unwrap_or("").to_string(), tool: None, form: None });
+        }
+    }
+    None
+}
+
+fn form_fields(form: &Value) -> Vec<Value> {
+    form["fields"].as_array().cloned().unwrap_or_default().into_iter().filter(|f| f["type"].as_str() != Some("external")).collect()
+}
+
+/// 提问写成正文（旧版 Friday、没开结构化工具事件时）：问题 + 带序号的选项，怎么回答
+fn form_text(form: &Value) -> String {
+    let fields = form_fields(form);
+    let mut t = String::from("\n\n**OpenCode 在问你：**\n");
+    for (i, f) in fields.iter().enumerate() {
+        let question = f["description"].as_str().filter(|s| !s.is_empty()).or_else(|| f["title"].as_str()).unwrap_or("");
+        if fields.len() > 1 {
+            t.push_str(&format!("\n{}. {question}\n", i + 1));
+        } else {
+            t.push_str(&format!("\n{question}\n"));
+        }
+        for (j, o) in f["options"].as_array().into_iter().flatten().enumerate() {
+            let label = o["label"].as_str().or_else(|| o["value"].as_str()).unwrap_or("");
+            match o["description"].as_str().filter(|d| !d.is_empty()) {
+                Some(d) => t.push_str(&format!("   {}) {label}：{d}\n", j + 1)),
+                None => t.push_str(&format!("   {}) {label}\n", j + 1)),
+            }
+        }
+        if f["type"].as_str() == Some("multiselect") {
+            t.push_str("   （可以选几个）\n");
+        }
+    }
+    if fields.len() > 1 {
+        t.push_str("\n回复选项的名字或序号，几题之间用「；」隔开；也可以直接说你的想法。");
+    } else {
+        t.push_str("\n回复选项的名字或序号，也可以直接说你的想法。");
+    }
+    t
+}
+
+/// 用户的回答 → 表单的 answer（{q0: "中文", q1: ["表格", "摘要"]}）；对不上（选项外的回答而这题不许自己写）返回 None。
+/// 几题时按「；」拆成每题一段（段数对不上就整句当每一题的回答）；「（跳过）」/ 空 = 这题不答
+fn form_answer(form: &Value, said: &str) -> Option<Value> {
+    let fields = form_fields(form);
+    let said = said.trim();
+    let parts: Vec<&str> = if fields.len() > 1 {
+        let parts: Vec<&str> = said.split(['；', ';', '\n']).map(str::trim).collect();
+        if parts.len() == fields.len() {
+            parts
+        } else {
+            vec![said; fields.len()]
+        }
+    } else {
+        vec![said]
+    };
+    let mut answer = serde_json::Map::new();
+    for (field, part) in fields.iter().zip(parts) {
+        let key = field["key"].as_str()?;
+        let part = part.trim().trim_end_matches(['。', '.', '！', '!']);
+        if part.is_empty() || part == "（跳过）" || part == "跳过" {
+            continue;
+        }
+        answer.insert(key.to_string(), field_value(field, part)?);
+    }
+    Some(Value::Object(answer))
+}
+
+fn field_value(field: &Value, text: &str) -> Option<Value> {
+    let options = field["options"].as_array().cloned().unwrap_or_default();
+    let custom = field["custom"].as_bool().unwrap_or(false) || options.is_empty();
+    match field["type"].as_str().unwrap_or("string") {
+        "multiselect" => {
+            let items: Vec<&str> = text.split(['、', ',', '，']).map(str::trim).filter(|s| !s.is_empty()).collect();
+            let matched: Vec<Value> = items.iter().filter_map(|i| match_option(&options, i)).map(Value::String).collect();
+            if !items.is_empty() && matched.len() == items.len() {
+                Some(Value::Array(matched))
+            } else if let Some(one) = match_option(&options, text) {
+                Some(json!([one]))
+            } else if custom {
+                Some(json!([text]))
+            } else {
+                None
+            }
+        }
+        "boolean" => {
+            let t = text.to_lowercase();
+            if ["是", "对", "好", "要", "yes", "y", "true", "需要", "可以"].contains(&t.as_str()) {
+                Some(Value::Bool(true))
+            } else if ["否", "不", "不要", "no", "n", "false", "不需要", "不用"].contains(&t.as_str()) {
+                Some(Value::Bool(false))
+            } else {
+                None
+            }
+        }
+        "number" | "integer" => text.parse::<f64>().ok().and_then(serde_json::Number::from_f64).map(Value::Number),
+        _ => match match_option(&options, text) {
+            Some(v) => Some(Value::String(v)),
+            None if custom => Some(Value::String(text.to_string())),
+            None => None,
+        },
+    }
+}
+
+/// 一段回答对上哪个选项（返回它的 value）：名字（不分大小写，也认去掉「（推荐）」「(Recommended)」的）、或序号「2」「第二个」「选 2」
+fn match_option(options: &[Value], text: &str) -> Option<String> {
+    fn bare(s: &str) -> String {
+        let mut s = s.trim().to_lowercase();
+        for tag in ["(recommended)", "（推荐）", "(推荐)", "【推荐】"] {
+            if let Some(stripped) = s.strip_suffix(tag) {
+                s = stripped.trim().to_string();
+            }
+        }
+        s
+    }
+    let t = bare(text);
+    if t.is_empty() {
+        return None;
+    }
+    for o in options {
+        let value = o["value"].as_str().unwrap_or("");
+        let label = o["label"].as_str().unwrap_or(value);
+        if bare(value) == t || bare(label) == t {
+            return Some(value.to_string());
+        }
+    }
+    let n = t.trim_start_matches(['选', '第']).trim().trim_end_matches(['个', '项', '号', '.', '、', ')', '）']).trim();
+    let index = match n {
+        "一" => Some(1),
+        "二" | "两" => Some(2),
+        "三" => Some(3),
+        "四" => Some(4),
+        "五" => Some(5),
+        "六" => Some(6),
+        _ => n.parse::<usize>().ok(),
+    }?;
+    options.get(index.checked_sub(1)?).and_then(|o| o["value"].as_str()).map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn form() -> Value {
+        json!({ "id": "frm_1", "fields": [
+            { "key": "q0", "type": "string", "description": "报告用什么语言？", "custom": true,
+              "options": [{ "value": "中文", "label": "中文" }, { "value": "英文 (Recommended)", "label": "英文 (Recommended)" }] },
+            { "key": "q1", "type": "multiselect", "description": "要哪些附件？", "custom": true,
+              "options": [{ "value": "表格", "label": "表格" }, { "value": "图表", "label": "图表" }, { "value": "摘要", "label": "摘要" }] }
+        ]})
+    }
+
+    #[test]
+    fn answers_each_question_by_label_or_number() {
+        assert_eq!(form_answer(&form(), "中文；表格、摘要"), Some(json!({ "q0": "中文", "q1": ["表格", "摘要"] })));
+        assert_eq!(form_answer(&form(), "2；第一个"), Some(json!({ "q0": "英文 (Recommended)", "q1": ["表格"] })));
+        assert_eq!(form_answer(&form(), "英文；1, 3"), Some(json!({ "q0": "英文 (Recommended)", "q1": ["表格", "摘要"] })));
+    }
+
+    #[test]
+    fn free_reply_goes_to_every_question() {
+        let a = form_answer(&form(), "你看着办，越详细越好").unwrap();
+        assert_eq!(a, json!({ "q0": "你看着办，越详细越好", "q1": ["你看着办，越详细越好"] }));
+        // 跳过的题不答
+        assert_eq!(form_answer(&form(), "中文；（跳过）"), Some(json!({ "q0": "中文" })));
+    }
+
+    #[test]
+    fn closed_question_without_match_is_none() {
+        let f = json!({ "fields": [{ "key": "q0", "type": "string", "options": [{ "value": "a", "label": "A" }], "custom": false }] });
+        assert_eq!(form_answer(&f, "a"), Some(json!({ "q0": "a" })));
+        assert_eq!(form_answer(&f, "别的"), None);
+    }
+
+    #[test]
+    fn form_text_lists_options() {
+        let t = form_text(&form());
+        assert!(t.contains("1. 报告用什么语言？") && t.contains("2) 英文 (Recommended)") && t.contains("（可以选几个）") && t.contains("「；」"));
+    }
+
+    #[test]
+    fn own_words_drops_sent_time() {
+        assert_eq!(own_words("中文；表格\n\n（发出时间：2026年11月12日 11:17）"), "中文；表格");
+        assert_eq!(approval("允许\n\n（发出时间：…）"), Some("once"));
+    }
 }

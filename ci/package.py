@@ -30,7 +30,7 @@ LICENSES = {
 
 
 def version(power: Path, executable: str):
-    # Rust 写的（opencode）：版本在 Cargo.toml 的 [package]
+    # Rust 写的（opencode、claudecode）：版本在 Cargo.toml 的 [package]
     cargo = power / "Cargo.toml"
     if cargo.exists():
         return re.search(r'(?m)^version\s*=\s*"([0-9.]+)"', cargo.read_text(encoding="utf-8")).group(1)

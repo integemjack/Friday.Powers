@@ -1,0 +1,24 @@
+[package]
+name = "friday-claudecode"
+version = "0.1.0"
+edition = "2021"
+description = "Friday 的 Claude Code 能力：把用户自己装的 Claude Code（claude 命令行）接成 OpenAI 兼容的流式接口"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "friday-claudecode"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+sha2 = "0.10"
+
+# 停 claude 时连它拉起的命令（同一个进程组）一起停
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "debuginfo"

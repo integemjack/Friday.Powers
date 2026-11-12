@@ -1,0 +1,29 @@
+{
+  "schema": 2,
+  "id": "claudecode",
+  "title": "Claude Code",
+  "detail": "把你自己装的 Claude Code（Anthropic 的命令行编程智能体）接进来：模型菜单里多一组「Claude Code」（默认 / Fable / Opus / Sonnet / Haiku）。选了它的对话交给你本机的 Claude Code 原样去做——用它自己的提示词、工具、登录和额度（订阅或 API 密钥，Friday 不经手也不读你的登录凭据），在这段对话的工作目录里读写文件、跑命令，内容实时显示；要权限时在对话里问你（按会话框下的权限档：自动 = 改工作目录里的文件不问、跑命令先问，计划 = 只读，完全 = 都不问）。要先装好 Claude Code，并在终端运行 claude auth login 登录。",
+  "executable": "friday-claudecode",
+  "serve": [
+    "serve",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "0",
+    "--data-dir",
+    "{models}",
+    "--token",
+    "{token}",
+    "--parent-stdin"
+  ],
+  "capabilities": [
+    "agentChat"
+  ],
+  "models": [],
+  "targets": {
+    "macos-arm64": { "detail": "Apple 芯片的 Mac" },
+    "windows-x64": { "detail": "Windows x64" },
+    "linux-x64": { "detail": "Linux x64" },
+    "linux-arm64": { "detail": "Linux ARM64" }
+  }
+}

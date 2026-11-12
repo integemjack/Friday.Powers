@@ -195,6 +195,14 @@ impl Bus {
     pub fn unsubscribe(&self, session: &str) {
         self.subs.lock().unwrap().remove(session);
     }
+
+    /// 另一个会话（这次请求派到后台的子智能体）的事件也送到 from 那个请求的收件箱：看它在做什么、有没有动静
+    pub fn follow(&self, session: &str, from: &str) {
+        let mut subs = self.subs.lock().unwrap();
+        if let Some(tx) = subs.get(from).cloned() {
+            subs.insert(session.to_string(), tx);
+        }
+    }
 }
 
 fn buses() -> &'static Mutex<HashMap<String, Arc<Bus>>> {

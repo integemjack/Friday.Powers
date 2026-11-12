@@ -27,17 +27,28 @@ pub struct Pending {
     pub tool: Option<serde_json::Value>,
     /// 提问（opencode 的 question 工具建的表单 form.created 的 form：{id, title, metadata, fields}）；None = 权限确认
     pub form: Option<serde_json::Value>,
+    /// 是哪个会话在问：None = 这段对话的会话；Some = 它派到后台的子智能体（回复要发到子会话）
+    pub session: Option<String>,
+}
+
+/// 这段对话派到后台、还没交回的子智能体：子会话 id → 父会话里那次 subagent 调用的 id（Friday 那边的工具行）。
+/// 一次请求停在确认 / 提问上结束时留着，下一次请求接着等它们时用来更新那一行（本程序重启后丢了也不要紧：在跑的子会话问 opencode）
+#[derive(Clone, Debug)]
+pub struct Child {
+    pub session: String,
+    pub call: String,
 }
 
 struct Store {
     path: PathBuf,
     entries: HashMap<String, Entry>,
     pending: HashMap<String, Pending>,
+    children: HashMap<String, Vec<Child>>,
 }
 
 fn store() -> &'static Mutex<Store> {
     static S: OnceLock<Mutex<Store>> = OnceLock::new();
-    S.get_or_init(|| Mutex::new(Store { path: PathBuf::new(), entries: HashMap::new(), pending: HashMap::new() }))
+    S.get_or_init(|| Mutex::new(Store { path: PathBuf::new(), entries: HashMap::new(), pending: HashMap::new(), children: HashMap::new() }))
 }
 
 pub fn now() -> u64 {
@@ -110,6 +121,19 @@ pub fn set_pending(key: &str, p: Option<Pending>) {
         Some(p) => s.pending.insert(key.to_string(), p),
         None => s.pending.remove(key),
     };
+}
+
+pub fn children(key: &str) -> Vec<Child> {
+    store().lock().unwrap().children.get(key).cloned().unwrap_or_default()
+}
+
+pub fn set_children(key: &str, children: Vec<Child>) {
+    let mut s = store().lock().unwrap();
+    if children.is_empty() {
+        s.children.remove(key);
+    } else {
+        s.children.insert(key.to_string(), children);
+    }
 }
 
 pub fn count() -> usize {

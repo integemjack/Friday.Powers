@@ -74,6 +74,19 @@
   （`GET /api/session/<id>/form`、`…/permission`，只列没答的），有就照上面处理，不会把回答当成新的话排在一直等着的表单后面。
 - 出错：还没写出任何内容时回 HTTP 错误码（OpenCode 报的 `status`，如 429 免费额度用完 / 402 余额不足），
   带 `Retry-After`（OpenCode 的 `retryAfterMs`）；已经在流了就在正文末尾写一句。
+- **派到后台的子智能体**（0.1.4）：`subagent` 工具带 `background: true` 时，父会话先报 `session.tool.progress`（`metadata.sessionID` = 子会话），
+  工具马上「成功」（结果「…working in the background (sessionID: ses_…)…」），这一轮随即结束；子智能体在子会话里接着跑，做完后父会话收到一条合成消息
+  （`session.inbox.enqueued`，`item.type = synthetic`，`payload.metadata = {source: "subagent", childID, state}`，正文是 `<subagent …>回报</subagent>`），
+  送达（`session.inbox.delivered`）后父会话自己再开一轮。桥：还有没交回的就**不收尾**——
+  - 那一行留着 `running`「在后台运行…」，跟着子会话（总线 `follow`）把它调的工具写上去（「在后台运行：运行 sleep 20」）；
+  - 收到合成消息时那一行标 `success`（`state = completed`）/ `failed`，结果是它的回报；父会话接着的那一轮照常流回来，和前面的文字空一行；
+  - 子会话要确认 / 提问（`permission.asked`、`form.created` 挂在子会话上）同样转给用户（正文「OpenCode 的后台子智能体想…」，那一行是子会话的工具），
+    下一句话回到子会话（`Pending.session`），然后接着等；
+  - 每次请求开头问 OpenCode 这个会话还有哪些子会话在跑（`GET /api/session/active` ∩ `GET /api/session?parentID=<id>`）接着等
+    （上一次停在确认上、本程序重启过、Friday 出错后「接着做」都不漏）；事件漏了也不干等：每分钟问一次，父、子会话都不在跑、
+    父会话也没有没送达的消息（`GET …/inbox`）就收尾；等子智能体时「没动静」的上限放宽到 6 小时。
+  - Friday 点停止 → 父会话和没交回的子会话一起中止。
+  Friday 2.97.27 起对这类请求不设 10 分钟的总时限（只有空闲超时，靠下面的空数据块保活）。
 - Friday 断开（点了停止）→ 中止 OpenCode 那次执行。15 分钟没有任何事件 → 中止、504。
   OpenCode 没动静时每 15 秒发一块空的 `delta`（不是 SSE 注释：EDITH / Friday 的读流按数据块算没超时）。
 

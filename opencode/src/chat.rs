@@ -14,6 +14,9 @@
 //! 提问（opencode 的 question 工具建一张表单 form.created，一直等到有人回答）：提问那一行标成等回答、这次回答到此结束；
 //! 用户下一句话就是回答——几题用「；」隔开、选项写名字或序号，填进表单（POST …/form/<id>/reply），opencode 接着做；
 //! 填不进去（选项外的回答而这题不许自己写）就取消提问、按新的话做。
+//! 派到后台的子智能体（subagent 工具 background: true）：父会话那一轮先结束，子智能体做完后 OpenCode 往父会话塞一条合成消息、自己再开一轮；
+//! 还有没交回的，这次回答就不收尾——那一行显示「在后台运行：它在做什么」，交回后标成功 / 失败（结果是它的回报），接着的那一轮照常流回来。
+//! 子智能体要确认 / 提问时同样转给用户（回复发到子会话），下一句话进来接着等它们。
 
 use std::net::TcpStream;
 use std::sync::mpsc::RecvTimeoutError;
@@ -598,9 +601,11 @@ fn run(be: &Backend, ask: &Ask, stream: &mut TcpStream, streaming: bool) -> Resu
                 quiet = p.tool.as_ref().and_then(|t| t["id"].as_str()).map(str::to_string);
                 store::set_pending(&ask.key, None);
                 let form = p.form.as_ref().unwrap();
+                // 后台子智能体问的：回复发到子会话
+                let asker = p.session.clone().unwrap_or_else(|| sid.clone());
                 let answer = form_answer(form, own_words(&ask.said));
                 let reply = match &answer {
-                    Some(a) => oc::post(&be.conn, &format!("/api/session/{sid}/form/{}/reply", p.request), dir, &json!({ "answer": a })),
+                    Some(a) => oc::post(&be.conn, &format!("/api/session/{asker}/form/{}/reply", p.request), dir, &json!({ "answer": a })),
                     None => Err("回答对不上表单（选项外的回答，而这题不许自己写）".to_string()),
                 };
                 let replied = matches!(reply, Ok((s, _)) if (200..300).contains(&s));
@@ -614,20 +619,23 @@ fn run(be: &Backend, ask: &Ask, stream: &mut TcpStream, streaming: bool) -> Resu
                     resumed = true;
                 } else {
                     // 填不进去：取消提问、停下这次执行，再把这句话当新的话发
-                    let _ = oc::delete(&be.conn, &format!("/api/session/{sid}/form/{}", p.request), dir);
-                    let _ = oc::post(&be.conn, &format!("/api/session/{sid}/interrupt"), dir, &json!({}));
-                    wait_stopped(&rx);
+                    let _ = oc::delete(&be.conn, &format!("/api/session/{asker}/form/{}", p.request), dir);
+                    if p.session.is_none() {
+                        let _ = oc::post(&be.conn, &format!("/api/session/{sid}/interrupt"), dir, &json!({}));
+                        wait_stopped(&rx);
+                    }
                 }
             } else if let Some(p) = pending {
                 carried = p.tool.clone();
                 store::set_pending(&ask.key, None);
                 let decision = approval(&ask.said).unwrap_or("reject");
-                let reply = oc::post(&be.conn, &format!("/api/session/{sid}/permission/{}/reply", p.request), dir, &json!({ "decision": decision }));
+                let asker = p.session.clone().unwrap_or_else(|| sid.clone());
+                let reply = oc::post(&be.conn, &format!("/api/session/{asker}/permission/{}/reply", p.request), dir, &json!({ "decision": decision }));
                 let replied = matches!(reply, Ok((s, _)) if (200..300).contains(&s));
                 backend::log(&format!("permission {} → {decision}（{}）", p.request, match &reply { Ok((s, _)) => format!("HTTP {s}"), Err(e) => e.clone() }));
                 if decision != "reject" && replied {
                     resumed = true;
-                } else if replied {
+                } else if replied && p.session.is_none() {
                     // 拒掉后 opencode 会中止这次执行：等它停下再发新的话
                     wait_stopped(&rx);
                 }
@@ -644,7 +652,7 @@ fn run(be: &Backend, ask: &Ask, stream: &mut TcpStream, streaming: bool) -> Resu
             }
             oc::ok(oc::post(&be.conn, &format!("/api/session/{sid}/prompt"), dir, &prompt), "发给 opencode")?;
         }
-        pump(be, ask, &sid, &rx, stream, streaming, if resumed { carried } else { None }, quiet)
+        pump(be, ask, &sid, &bus, &rx, stream, streaming, if resumed { carried } else { None }, quiet)
     })();
     bus.unsubscribe(&sid);
     if ask.key.is_empty() {
@@ -660,6 +668,7 @@ fn pump(
     be: &Backend,
     ask: &Ask,
     sid: &str,
+    bus: &oc::Bus,
     rx: &std::sync::mpsc::Receiver<Value>,
     stream: &mut TcpStream,
     streaming: bool,
@@ -672,10 +681,16 @@ fn pump(
     let mut names: std::collections::HashMap<String, String> = Default::default();
     // 这次（和放行的那个）报过开始的工具：id → {id, name, title, summary, input}；之后的状态都带上这几项
     let mut called: std::collections::HashMap<String, Value> = Default::default();
+    // 这次派到后台、还没报子会话的 subagent 调用
+    let mut bg_calls: std::collections::HashSet<String> = Default::default();
     if let Some(tool) = carried {
         if let Some(id) = tool["id"].as_str() {
             names.insert(id.to_string(), tool["name"].as_str().unwrap_or("").to_string());
             called.insert(id.to_string(), tool.clone());
+            // 自动档下派子智能体要确认：放行的那次 subagent 调用是派到后台的（参数在上一次请求里报过）
+            if tool["name"].as_str() == Some("subagent") && tool["input"]["background"].as_bool() == Some(true) {
+                bg_calls.insert(id.to_string());
+            }
         }
     }
     let update = |called: &std::collections::HashMap<String, Value>, id: &str, name: &str, extra: Value| -> Value {
@@ -689,12 +704,30 @@ fn pump(
     let mut failure: Option<Failure> = None;
     let mut last_event = Instant::now();
     let mut waiting_permission = false;
+    // 后台子智能体：上一次请求停在确认 / 提问上时还没交回的、opencode 里这个会话还在跑的子会话，接着等
+    let mut background: Vec<Background> = Vec::new();
+    let mut followed = Followed { bus, ids: Vec::new() };
+    if !ask.key.is_empty() {
+        let known = store::children(&ask.key);
+        for child in running_children(be, sid, dir) {
+            let call = known.iter().find(|c| c.session == child).map(|c| c.call.clone()).unwrap_or_default();
+            backend::log(&format!("session {sid} 还有在后台跑的子智能体 {child}，接着等"));
+            adopt(&mut background, &mut followed, sid, &child, &call);
+        }
+    }
+    // 父会话又开了一轮（后台子智能体交回后）：接着的文字和前面空一行
+    let mut gap = false;
+    let mut last_check = Instant::now();
     loop {
         if out.gone {
-            // Friday 停了 / 断了：opencode 也停
+            // Friday 停了 / 断了：opencode 也停（派到后台的子智能体一起停）
             let _ = oc::post(&be.conn, &format!("/api/session/{sid}/interrupt"), dir, &json!({}));
+            for b in background.iter().filter(|b| !b.handled) {
+                let _ = oc::post(&be.conn, &format!("/api/session/{}/interrupt", b.child), dir, &json!({}));
+            }
             if !ask.key.is_empty() {
                 store::set_pending(&ask.key, None);
+                store::set_children(&ask.key, Vec::new());
             }
             return Ok(());
         }
@@ -702,9 +735,21 @@ fn pump(
             Ok(e) => e,
             Err(RecvTimeoutError::Timeout) => {
                 out.ping();
-                if last_event.elapsed() > Duration::from_secs(900) {
+                let waiting = background.iter().any(|b| !b.handled) || !bg_calls.is_empty();
+                if waiting && last_check.elapsed() > Duration::from_secs(60) {
+                    // 事件漏了也不干等：父会话、子智能体都不在跑，也没有没送达的消息，就收尾
+                    last_check = Instant::now();
+                    if !still_waiting(be, sid, dir, &background) {
+                        backend::log(&format!("session {sid} 后台子智能体都不在跑了，收尾"));
+                        break;
+                    }
+                }
+                // 等后台子智能体时它跑长命令可以很久没动静（Friday 点停止随时能停）
+                let limit = if waiting { 6 * 3600 } else { 900 };
+                if last_event.elapsed() > Duration::from_secs(limit) {
                     let _ = oc::post(&be.conn, &format!("/api/session/{sid}/interrupt"), dir, &json!({}));
-                    failure = Some(Failure { status: 504, kind: "timeout".into(), message: "opencode 15 分钟没有动静，已停下".into(), retry_after_ms: 0 });
+                    let message = format!("opencode {}没有动静，已停下", if waiting { "6 小时" } else { "15 分钟" });
+                    failure = Some(Failure { status: 504, kind: "timeout".into(), message, retry_after_ms: 0 });
                     break;
                 }
                 continue;
@@ -717,8 +762,43 @@ fn pump(
         last_event = Instant::now();
         let t = event["type"].as_str().unwrap_or("");
         let d = &event["data"];
+        // 别的会话（这次等着的后台子智能体）的事件：看它在做什么（写到父会话那一行上），它要确认 / 提问时转给用户；别的不管
+        let from = d["sessionID"].as_str().or_else(|| d["form"]["sessionID"].as_str()).unwrap_or(sid).to_string();
+        let child = from != sid;
+        if child {
+            match t {
+                "session.tool.input.started" => {
+                    names.insert(d["id"].as_str().unwrap_or("").to_string(), d["name"].as_str().unwrap_or("").to_string());
+                    continue;
+                }
+                "session.tool.called" => {
+                    let id = d["id"].as_str().unwrap_or("").to_string();
+                    let name = names.get(&id).cloned().unwrap_or_default();
+                    let arg = tool_arg(&d["input"], &ask.dir);
+                    called.insert(id.clone(), json!({ "id": id, "name": name, "title": tool_label(&name), "summary": arg, "input": relative(&d["input"], &ask.dir) }));
+                    if let Some(b) = background.iter().find(|b| b.child == from && !b.call.is_empty() && b.inbox.is_none()) {
+                        if structured {
+                            out.tool(update(&called, &b.call, "subagent", json!({ "status": "running", "output": format!("在后台运行：{} {}", tool_label(&name), arg) })));
+                        }
+                    }
+                    continue;
+                }
+                "permission.asked" | "form.created" => {}
+                _ => continue,
+            }
+        }
+        // 后台子智能体要确认 / 提问时正文里这么称呼它
+        let who = if child { "OpenCode 的后台子智能体" } else { "OpenCode" };
         match t {
-            "session.text.delta" => out.emit(json!({ "content": d["delta"].as_str().unwrap_or("") })),
+            "session.text.delta" => {
+                let mut text = d["delta"].as_str().unwrap_or("").to_string();
+                if gap && !text.is_empty() {
+                    gap = false;
+                    let sep = if out.content.ends_with("\n\n") || out.content.is_empty() { "" } else if out.content.ends_with('\n') { "\n" } else { "\n\n" };
+                    text.insert_str(0, sep);
+                }
+                out.emit(json!({ "content": text }));
+            }
             "session.reasoning.delta" => out.emit(json!({ "reasoning_content": d["delta"].as_str().unwrap_or("") })),
             "session.tool.input.started" => {
                 names.insert(d["id"].as_str().unwrap_or("").to_string(), d["name"].as_str().unwrap_or("").to_string());
@@ -727,6 +807,9 @@ fn pump(
                 let id = d["id"].as_str().unwrap_or("").to_string();
                 let name = names.get(&id).cloned().unwrap_or_default();
                 let arg = tool_arg(&d["input"], &ask.dir);
+                if name == "subagent" && d["input"]["background"].as_bool() == Some(true) {
+                    bg_calls.insert(id.clone());
+                }
                 if structured {
                     let tool = json!({ "id": id, "name": name, "title": tool_label(&name), "summary": arg, "input": relative(&d["input"], &ask.dir) });
                     called.insert(id.clone(), tool.clone());
@@ -736,6 +819,72 @@ fn pump(
                 }
             }
             "session.tool.success" | "session.tool.failed" if quiet.as_deref().is_some_and(|q| d["id"].as_str() == Some(q)) => {}
+            "session.tool.progress" => {
+                // 派到后台的子智能体报了子会话 id：开始跟着它
+                let id = d["id"].as_str().unwrap_or("").to_string();
+                if let Some(child) = d["metadata"]["sessionID"].as_str().filter(|_| bg_calls.contains(&id)) {
+                    adopt(&mut background, &mut followed, sid, child, &id);
+                }
+            }
+            "session.tool.success"
+                if bg_calls.contains(d["id"].as_str().unwrap_or(""))
+                    || (names.get(d["id"].as_str().unwrap_or("")).map(String::as_str) == Some("subagent")
+                        && full_text(&d["content"]).contains("working in the background")) =>
+            {
+                // 派到后台了（工具马上就「成功」，结果说它在后台跑）：那一行留着运行中，等它交回
+                let id = d["id"].as_str().unwrap_or("").to_string();
+                bg_calls.remove(&id);
+                let text = full_text(&d["content"]);
+                match d["metadata"]["sessionID"].as_str().map(str::to_string).or_else(|| child_in(&text)) {
+                    Some(child) => {
+                        adopt(&mut background, &mut followed, sid, &child, &id);
+                        backend::log(&format!("subagent {child} 在后台跑 session={sid}"));
+                        if structured {
+                            out.tool(update(&called, &id, "subagent", json!({ "status": "running", "output": "在后台运行…" })));
+                        } else {
+                            out.emit(json!({ "reasoning_content": "  … 在后台运行\n" }));
+                        }
+                    }
+                    None => {
+                        if structured {
+                            out.tool(update(&called, &id, "subagent", json!({ "status": "success", "output": cut(&text, 8000) })));
+                        }
+                    }
+                }
+            }
+            "session.inbox.enqueued" => {
+                // 后台子智能体交回了（父会话收到一条合成消息，送达后它接着做）：那一行标成功 / 失败，结果是它的回报
+                let payload = &d["item"]["payload"];
+                let meta = &payload["metadata"];
+                if meta["source"].as_str() == Some("subagent") {
+                    let kid = meta["childID"].as_str().unwrap_or("");
+                    if let Some(b) = background.iter_mut().find(|b| b.child == kid) {
+                        b.inbox = d["inboxID"].as_str().map(str::to_string);
+                        let state = meta["state"].as_str().unwrap_or("");
+                        let report = subagent_report(payload["text"].as_str().unwrap_or(""));
+                        backend::log(&format!("subagent {kid} 交回（{state}）session={sid}"));
+                        if structured && !b.call.is_empty() {
+                            let status = if state == "completed" { "success" } else { "failed" };
+                            out.tool(update(&called, &b.call, "subagent", json!({ "status": status, "output": cut(&report, 8000) })));
+                        } else if !structured {
+                            out.emit(json!({ "reasoning_content": format!("\n▸ 后台子智能体交回了（{state}）\n") }));
+                        }
+                        followed.bus.unsubscribe(kid);
+                    }
+                }
+            }
+            "session.inbox.delivered" => {
+                if let Some(inbox) = d["inboxID"].as_str() {
+                    for b in background.iter_mut().filter(|b| b.inbox.as_deref() == Some(inbox)) {
+                        b.handled = true;
+                    }
+                }
+            }
+            "session.execution.started" => {
+                if !out.content.is_empty() {
+                    gap = true;
+                }
+            }
             "session.tool.success" => {
                 if structured {
                     let id = d["id"].as_str().unwrap_or("").to_string();
@@ -762,7 +911,7 @@ fn pump(
                 let request = d["id"].as_str().unwrap_or("").to_string();
                 if ask.key.is_empty() {
                     // 一次性请求不该用工具：直接拒
-                    let _ = oc::post(&be.conn, &format!("/api/session/{sid}/permission/{request}/reply"), dir, &json!({ "decision": "reject" }));
+                    let _ = oc::post(&be.conn, &format!("/api/session/{from}/permission/{request}/reply"), dir, &json!({ "decision": "reject" }));
                     continue;
                 }
                 // 对应的工具行标成「等确认」（不然一直显示运行中）
@@ -775,15 +924,15 @@ fn pump(
                 if structured {
                     // 要做的事已经在等确认的工具行上了（带允许 / 拒绝按钮）：正文只说一句
                     out.emit(json!({ "content": format!(
-                        "\n\nOpenCode 想{}，等你确认：点上面的「允许执行」或回复「允许」（「总是允许」以后同类不再问）；回复别的就取消，按你新说的做。",
+                        "\n\n{who}想{}，等你确认：点上面的「允许执行」或回复「允许」（「总是允许」以后同类不再问）；回复别的就取消，按你新说的做。",
                         permission_label(&action)) }));
                 } else {
                     out.emit(json!({ "content": format!(
-                        "\n\n> **OpenCode 想{}**\n\n```\n{}\n```\n\n回复「允许」放行这一次，回复「总是允许」以后同类操作不再问；回复别的就取消，按你新说的做。",
+                        "\n\n> **{who}想{}**\n\n```\n{}\n```\n\n回复「允许」放行这一次，回复「总是允许」以后同类操作不再问；回复别的就取消，按你新说的做。",
                         permission_label(&action), list) }));
                 }
-                backend::log(&format!("permission asked {request} action={action} session={sid}"));
-                store::set_pending(&ask.key, Some(store::Pending { request, tool: called.get(&call).cloned(), form: None }));
+                backend::log(&format!("permission asked {request} action={action} session={from}"));
+                store::set_pending(&ask.key, Some(store::Pending { request, tool: called.get(&call).cloned(), form: None, session: child.then(|| from.clone()) }));
                 waiting_permission = true;
                 break;
             }
@@ -792,7 +941,7 @@ fn pump(
                 let form_id = form["id"].as_str().unwrap_or("").to_string();
                 if ask.key.is_empty() {
                     // 一次性请求不该问：取消
-                    let _ = oc::delete(&be.conn, &format!("/api/session/{sid}/form/{form_id}"), dir);
+                    let _ = oc::delete(&be.conn, &format!("/api/session/{from}/form/{form_id}"), dir);
                     continue;
                 }
                 // 提问那一行标成等回答（Friday 认 questions 时就地画成选项卡片）
@@ -807,11 +956,13 @@ fn pump(
                     out.tool(update(&called, &call, &name, json!({ "status": "waiting", "output": "等你回答" })));
                 }
                 if !(structured && ask.questions) {
-                    out.emit(json!({ "content": form_text(&form) }));
+                    out.emit(json!({ "content": form_text(&form).replacen("OpenCode", who, 1) }));
+                } else if child {
+                    out.emit(json!({ "content": "\n\nOpenCode 的后台子智能体在问你（上面的卡片）。" }));
                 }
-                backend::log(&format!("form asked {form_id} fields={} session={sid}", form["fields"].as_array().map(Vec::len).unwrap_or(0)));
+                backend::log(&format!("form asked {form_id} fields={} session={from}", form["fields"].as_array().map(Vec::len).unwrap_or(0)));
                 let tool = called.get(&call).cloned().or_else(|| (!call.is_empty()).then(|| json!({ "id": call, "name": "question", "title": tool_label("question") })));
-                store::set_pending(&ask.key, Some(store::Pending { request: form_id, tool, form: Some(form) }));
+                store::set_pending(&ask.key, Some(store::Pending { request: form_id, tool, form: Some(form), session: child.then(|| from.clone()) }));
                 waiting_permission = true;
                 break;
             }
@@ -839,6 +990,13 @@ fn pump(
                 }
                 break;
             }
+            "session.execution.succeeded"
+                if (background.iter().any(|b| !b.handled) || !bg_calls.is_empty()) && still_waiting(be, sid, dir, &background) =>
+            {
+                // 这一轮完了，派到后台的子智能体还没交回：不收尾，等它交回后 opencode 接着开的那一轮
+                backend::log(&format!("session {sid} 这一轮完了，还在等 {} 个后台子智能体", background.iter().filter(|b| !b.handled).count()));
+                last_check = Instant::now();
+            }
             "session.execution.succeeded" | "session.execution.interrupted" => break,
             "bridge.disconnected" => {
                 failure = Some(Failure { status: 502, kind: "opencode_error".into(), message: "和 opencode 的连接断了".into(), retry_after_ms: 0 });
@@ -849,6 +1007,10 @@ fn pump(
         }
     }
     let _ = waiting_permission;
+    if !ask.key.is_empty() {
+        // 停在确认 / 提问上、出错结束时还没交回的：下一次请求接着等（用来更新那一行）
+        store::set_children(&ask.key, background.iter().filter(|b| !b.handled).map(|b| store::Child { session: b.child.clone(), call: b.call.clone() }).collect());
+    }
     if let Some(f) = &failure {
         if !out.started() {
             // 什么都还没写：回 HTTP 错误码（429 / 402 让 Friday 按额度处理，带上多久后再试）
@@ -966,22 +1128,129 @@ fn wait_stopped(rx: &std::sync::mpsc::Receiver<Value>) {
 
 /// 这段对话在 opencode 那边有没有还在等的提问（表单）或权限确认（本程序重启过、内存里没记着时用）
 fn waiting_in_opencode(be: &Backend, sid: &str, dir: Option<&str>) -> Option<store::Pending> {
+    if let Some(p) = waiting_in(be, sid, dir) {
+        return Some(p);
+    }
+    // 派到后台、还在跑的子智能体在等确认 / 回答：回复要发到子会话
+    for child in running_children(be, sid, dir) {
+        if let Some(mut p) = waiting_in(be, &child, dir) {
+            p.session = Some(child);
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// 这个会话自己有没有在等的提问（表单）或权限确认
+fn waiting_in(be: &Backend, sid: &str, dir: Option<&str>) -> Option<store::Pending> {
     let pending = |item: &Value| item["state"]["status"].as_str().map(|s| s == "pending").unwrap_or(true) && item["id"].as_str().is_some();
     if let Ok((200, v)) = oc::get(&be.conn, &format!("/api/session/{sid}/form"), dir) {
         if let Some(form) = v["data"].as_array().into_iter().flatten().find(|f| pending(f)) {
             let call = form["metadata"]["tool"]["id"].as_str().unwrap_or("");
             let tool = (!call.is_empty()).then(|| json!({ "id": call, "name": "question", "title": tool_label("question"), "input": question_input(form) }));
             backend::log(&format!("session {sid} 还有没答的提问 {}", form["id"].as_str().unwrap_or("")));
-            return Some(store::Pending { request: form["id"].as_str().unwrap_or("").to_string(), tool, form: Some(form.clone()) });
+            return Some(store::Pending { request: form["id"].as_str().unwrap_or("").to_string(), tool, form: Some(form.clone()), session: None });
         }
     }
     if let Ok((200, v)) = oc::get(&be.conn, &format!("/api/session/{sid}/permission"), dir) {
         if let Some(r) = v["data"].as_array().into_iter().flatten().find(|r| pending(r)) {
             backend::log(&format!("session {sid} 还有没确认的权限请求 {}", r["id"].as_str().unwrap_or("")));
-            return Some(store::Pending { request: r["id"].as_str().unwrap_or("").to_string(), tool: None, form: None });
+            return Some(store::Pending { request: r["id"].as_str().unwrap_or("").to_string(), tool: None, form: None, session: None });
         }
     }
     None
+}
+
+/// 这次请求等着的后台子智能体（subagent 工具 background: true）：父会话那一轮先结束，子智能体做完后 OpenCode 往父会话塞一条
+/// 合成消息（metadata.source = subagent、childID、state，正文是它的回报），送达后父会话自己再开一轮接着做
+struct Background {
+    child: String,
+    /// 父会话里那次 subagent 调用（Friday 那边的工具行）；本程序重启后从 opencode 找回来的不知道，为空
+    call: String,
+    /// 报它交回的那条合成消息
+    inbox: Option<String>,
+    /// 那条消息送达了：父会话接着的那一轮在处理它
+    handled: bool,
+}
+
+/// 这次请求跟着的子会话：结束时从总线上摘掉
+struct Followed<'a> {
+    bus: &'a oc::Bus,
+    ids: Vec<String>,
+}
+
+impl Drop for Followed<'_> {
+    fn drop(&mut self) {
+        for id in &self.ids {
+            self.bus.unsubscribe(id);
+        }
+    }
+}
+
+/// 开始等一个后台子智能体（已经在等的补上它那一行的 id）
+fn adopt(background: &mut Vec<Background>, followed: &mut Followed, sid: &str, child: &str, call: &str) {
+    if let Some(b) = background.iter_mut().find(|b| b.child == child) {
+        if b.call.is_empty() {
+            b.call = call.to_string();
+        }
+        return;
+    }
+    followed.bus.follow(child, sid);
+    followed.ids.push(child.to_string());
+    background.push(Background { child: child.to_string(), call: call.to_string(), inbox: None, handled: false });
+}
+
+/// subagent 工具的结果「…working in the background (sessionID: ses_…)…」里的子会话 id
+fn child_in(text: &str) -> Option<String> {
+    let at = text.find("sessionID: ")? + "sessionID: ".len();
+    let id: String = text[at..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+    id.starts_with("ses_").then_some(id)
+}
+
+/// 子智能体交回的合成消息去掉外面的 <subagent …> 标签，只留它的回报
+fn subagent_report(text: &str) -> String {
+    let t = text.trim();
+    let t = match t.find('>') {
+        Some(i) if t.starts_with("<subagent") => &t[i + 1..],
+        _ => t,
+    };
+    t.trim_end().trim_end_matches("</subagent>").trim().to_string()
+}
+
+/// opencode 里正在跑的会话（/api/session/active）；问不到 = None
+fn active_sessions(be: &Backend, dir: Option<&str>) -> Option<std::collections::HashSet<String>> {
+    match oc::get(&be.conn, "/api/session/active", dir) {
+        Ok((200, v)) => Some(v["data"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default()),
+        _ => None,
+    }
+}
+
+/// 这个会话派出去、还在跑的子会话（正在跑的 ∩ parentID 是它的）
+fn running_children(be: &Backend, sid: &str, dir: Option<&str>) -> Vec<String> {
+    let Some(active) = active_sessions(be, dir).filter(|a| !a.is_empty()) else { return Vec::new() };
+    match oc::get(&be.conn, &format!("/api/session?parentID={sid}&limit=100"), dir) {
+        Ok((200, v)) => v["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s["id"].as_str())
+            .filter(|id| active.contains(*id))
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// 还要不要接着等：父会话在跑、没交回的后台子智能体还在跑，或者父会话还有没送达的消息（子智能体交回的那条）；问不到就接着等
+fn still_waiting(be: &Backend, sid: &str, dir: Option<&str>, background: &[Background]) -> bool {
+    let Some(active) = active_sessions(be, dir) else { return true };
+    if active.contains(sid) || background.iter().any(|b| !b.handled && active.contains(&b.child)) {
+        return true;
+    }
+    match oc::get(&be.conn, &format!("/api/session/{sid}/inbox"), dir) {
+        Ok((200, v)) => v["data"].as_array().is_some_and(|a| !a.is_empty()),
+        _ => true,
+    }
 }
 
 fn form_fields(form: &Value) -> Vec<Value> {
@@ -1142,6 +1411,16 @@ mod tests {
         assert_eq!(a, json!({ "q0": "你看着办，越详细越好", "q1": ["你看着办，越详细越好"] }));
         // 跳过的题不答
         assert_eq!(form_answer(&form(), "中文；（跳过）"), Some(json!({ "q0": "中文" })));
+    }
+
+    #[test]
+    fn background_subagent_texts() {
+        let text = "The subagent is working in the background (sessionID: ses_e31668e14ffeDczMI20uo39aQg). You will be notified automatically when it finishes.";
+        assert_eq!(child_in(text).as_deref(), Some("ses_e31668e14ffeDczMI20uo39aQg"));
+        assert_eq!(child_in("Task done"), None);
+        let report = "<subagent sessionID=\"ses_x\" state=\"completed\" description=\"写 a.txt\">\n任务已完成。\n\n**文件内容：** hello\n</subagent>";
+        assert_eq!(subagent_report(report), "任务已完成。\n\n**文件内容：** hello");
+        assert_eq!(subagent_report("没有标签的回报"), "没有标签的回报");
     }
 
     #[test]

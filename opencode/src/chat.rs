@@ -7,6 +7,8 @@
 //!   cwd         工作目录（opencode 在这里读写、跑命令）；没有就用本程序的数据目录下的 work
 //!   permission  Friday 会话框下的权限档：auto（默认：读写工作目录里的文件不问，跑命令等先问）| plan（只读）| full（都不问）
 //!   questions   Friday 会把等回答的提问行画成选项卡片（v2.97.25 起）：提问时正文不再列一遍问题
+//!   continuing  这句是 Friday 自己接着做的话（出错后自动恢复、点了重试、换了模型接着做），不是用户说的：
+//!               还在等的提问 / 确认不拿它当回答，原样再交回去（工具行再标一次等回答，这次到此为止）
 //! 要用户确认的操作（opencode 的 permission.asked）：这次回答以一段说明结束，opencode 那边停着等；用户下一句说「允许」/「总是允许」
 //! 就放行并接着把后面的内容流回来，说别的就拒绝、再按新的话做。
 //! 提问（opencode 的 question 工具建一张表单 form.created，一直等到有人回答）：提问那一行标成等回答、这次回答到此结束；
@@ -43,6 +45,8 @@ struct Ask {
     tool_events: bool,
     /// Friday 把等回答的提问行画成选项卡片（x_friday.questions）：提问时正文不再列问题
     questions: bool,
+    /// 这句是 Friday 自己接着做的话（x_friday.continuing）：不是对提问 / 确认的回答
+    continuing: bool,
 }
 
 fn text_of(content: &Value) -> String {
@@ -140,6 +144,7 @@ fn parse(body: &Value) -> Result<Ask, String> {
     let permission = xf["permission"].as_str().unwrap_or("auto").to_string();
     let tool_events = xf["toolEvents"].as_bool().unwrap_or(false);
     let questions = xf["questions"].as_bool().unwrap_or(false);
+    let continuing = xf["continuing"].as_bool().unwrap_or(false);
     let messages: Vec<Value> = body["messages"].as_array().cloned().unwrap_or_default();
     let last_user = messages.iter().rposition(|m| m["role"].as_str() == Some("user"));
     let Some(last_user) = last_user else { return Err("messages 里没有用户的话".into()) };
@@ -177,7 +182,7 @@ fn parse(body: &Value) -> Result<Ask, String> {
     } else {
         (said.clone(), tail(&transcript(before), 12000))
     };
-    Ok(Ask { provider, model_id, model, key, dir, permission, text, said, files, history, tool_events, questions })
+    Ok(Ask { provider, model_id, model, key, dir, permission, text, said, files, history, tool_events, questions, continuing })
 }
 
 fn rule(action: &str, effect: &str) -> Value {
@@ -576,12 +581,21 @@ fn run(be: &Backend, ask: &Ask, stream: &mut TcpStream, streaming: bool) -> Resu
         // 上一句停在权限确认上：这句是「允许」就放行接着收，否则拒掉再按新的话做
         let mut resumed = false;
         let mut carried = None;
+        // 回答过的提问：opencode 之后报它做完不再转给 Friday（那一行已经记着「回答：…」，再报会盖掉；Friday 重开过的还会多出一行空的）
+        let mut quiet = None;
         if !ask.key.is_empty() {
             // 内存里没记着（本程序闲置被停过、重启了）：问 opencode 这个会话还有没有在等的提问 / 确认
             let pending = store::pending(&ask.key).or_else(|| waiting_in_opencode(be, &sid, dir));
+            if let Some(p) = pending.as_ref().filter(|_| ask.continuing) {
+                // Friday 自己接着做的话（出错后自动恢复、点了重试）不是回答：还在等的提问 / 确认原样再交回去，这次到此为止
+                backend::log(&format!("session {sid} 还在等 {}，这句是 Friday 接着做的话：再交回去", p.request));
+                store::set_pending(&ask.key, Some(p.clone()));
+                reshow(ask, p, stream, streaming);
+                return Ok(());
+            }
             if let Some(p) = pending.as_ref().filter(|p| p.form.is_some()) {
                 // 上一句停在提问上：这句话就是回答
-                carried = p.tool.clone();
+                quiet = p.tool.as_ref().and_then(|t| t["id"].as_str()).map(str::to_string);
                 store::set_pending(&ask.key, None);
                 let form = p.form.as_ref().unwrap();
                 let answer = form_answer(form, own_words(&ask.said));
@@ -630,7 +644,7 @@ fn run(be: &Backend, ask: &Ask, stream: &mut TcpStream, streaming: bool) -> Resu
             }
             oc::ok(oc::post(&be.conn, &format!("/api/session/{sid}/prompt"), dir, &prompt), "发给 opencode")?;
         }
-        pump(be, ask, &sid, &rx, stream, streaming, if resumed { carried } else { None })
+        pump(be, ask, &sid, &rx, stream, streaming, if resumed { carried } else { None }, quiet)
     })();
     bus.unsubscribe(&sid);
     if ask.key.is_empty() {
@@ -639,7 +653,9 @@ fn run(be: &Backend, ask: &Ask, stream: &mut TcpStream, streaming: bool) -> Resu
     result
 }
 
-/// carried：放行的那个等确认的工具（上一次请求里报过开始），这次报它做完时带上它的名字和参数
+/// carried：放行的那个等确认的工具（上一次请求里报过开始），这次报它做完时带上它的名字和参数；
+/// quiet：回答过的提问（它做完不再报）
+#[allow(clippy::too_many_arguments)]
 fn pump(
     be: &Backend,
     ask: &Ask,
@@ -648,6 +664,7 @@ fn pump(
     stream: &mut TcpStream,
     streaming: bool,
     carried: Option<Value>,
+    quiet: Option<String>,
 ) -> Result<(), String> {
     let dir = Some(ask.dir.as_str());
     let mut out = Out { stream: Some(stream), sse: None, streaming, model: ask.model.clone(), content: String::new(), reasoning: String::new(), gone: false, tools: 0 };
@@ -718,6 +735,7 @@ fn pump(
                     out.emit(json!({ "reasoning_content": format!("\n▸ {} {}\n", tool_label(&name), arg) }));
                 }
             }
+            "session.tool.success" | "session.tool.failed" if quiet.as_deref().is_some_and(|q| d["id"].as_str() == Some(q)) => {}
             "session.tool.success" => {
                 if structured {
                     let id = d["id"].as_str().unwrap_or("").to_string();
@@ -781,6 +799,11 @@ fn pump(
                 let call = form["metadata"]["tool"]["id"].as_str().unwrap_or("").to_string();
                 if structured && !call.is_empty() {
                     let name = names.get(&call).cloned().filter(|n| !n.is_empty()).unwrap_or_else(|| "question".to_string());
+                    // 没见过这次调用的参数（报开始在更早的请求里）：按表单补上，Friday 照它画选项卡片
+                    if !called.get(&call).is_some_and(|t| t["input"]["questions"].is_array()) {
+                        let tool = update(&called, &call, &name, json!({ "input": question_input(&form) }));
+                        called.insert(call.clone(), tool);
+                    }
                     out.tool(update(&called, &call, &name, json!({ "status": "waiting", "output": "等你回答" })));
                 }
                 if !(structured && ask.questions) {
@@ -841,13 +864,18 @@ fn pump(
         }
         out.emit(json!({ "content": format!("\n\n（OpenCode 出错：{}）", f.message) }));
     }
-    let usage = usage.json();
-    if streaming {
+    close(&mut out, ask, &usage.json());
+    Ok(())
+}
+
+/// 这次回答收尾：流式的发结束块（带用量），非流式的回整段
+fn close(out: &mut Out, ask: &Ask, usage: &Value) {
+    if out.streaming {
         if out.sse.is_none() && !out.gone {
             out.emit(json!({ "content": "" }));
         }
         if let Some(sse) = out.sse.as_mut() {
-            sse.data(&chunk(&ask.model, json!({}), Some("stop"), Some(&usage)));
+            sse.data(&chunk(&ask.model, json!({}), Some("stop"), Some(usage)));
             sse.done();
         }
     } else if let Some(s) = out.stream.take() {
@@ -865,7 +893,64 @@ fn pump(
             }),
         );
     }
-    Ok(())
+}
+
+/// 还在等的提问 / 确认再交回去（这句是 Friday 自己接着做的话，不是回答）：工具行再标一次等回答 / 等确认
+///（重开过的 Friday 照它重新画选项卡片 / 允许按钮），正文同第一次问时
+fn reshow(ask: &Ask, p: &store::Pending, stream: &mut TcpStream, streaming: bool) {
+    let mut out = Out { stream: Some(stream), sse: None, streaming, model: ask.model.clone(), content: String::new(), reasoning: String::new(), gone: false, tools: 0 };
+    let structured = ask.tool_events && streaming;
+    let row = p.tool.clone().filter(|_| structured);
+    match &p.form {
+        Some(form) => {
+            if let Some(mut tool) = row.clone() {
+                if !tool["input"]["questions"].is_array() {
+                    tool["input"] = question_input(form);
+                }
+                tool["status"] = json!("waiting");
+                tool["output"] = json!("等你回答");
+                out.tool(tool);
+            }
+            if !(row.is_some() && ask.questions) {
+                out.emit(json!({ "content": form_text(form) }));
+            }
+        }
+        None => {
+            if let Some(mut tool) = row.clone() {
+                tool["status"] = json!("waiting");
+                tool["output"] = json!("等你确认");
+                out.tool(tool);
+            }
+            out.emit(json!({ "content": if row.is_some() {
+                "\n\nOpenCode 还在等你确认上一步要做的操作：点上面的「允许执行」或回复「允许」（「总是允许」以后同类不再问）；回复别的就取消，按你新说的做。"
+            } else {
+                "\n\nOpenCode 还在等你确认上一步要做的操作：回复「允许」放行这一次，回复「总是允许」以后同类操作不再问；回复别的就取消，按你新说的做。"
+            } }));
+        }
+    }
+    close(&mut out, ask, &Usage::default().json());
+}
+
+/// 表单 → question 工具的参数（{questions: [{header, question, options: [{label, description}], multiple}]}）：Friday 照它画选项卡片
+fn question_input(form: &Value) -> Value {
+    let questions: Vec<Value> = form_fields(form)
+        .iter()
+        .map(|f| {
+            let options: Vec<Value> = f["options"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|o| json!({ "label": o["label"].as_str().or_else(|| o["value"].as_str()).unwrap_or(""), "description": o["description"].as_str().unwrap_or("") }))
+                .collect();
+            json!({
+                "header": f["title"].as_str().unwrap_or(""),
+                "question": f["description"].as_str().filter(|s| !s.is_empty()).or_else(|| f["title"].as_str()).unwrap_or(""),
+                "options": options,
+                "multiple": f["type"].as_str() == Some("multiselect"),
+            })
+        })
+        .collect();
+    json!({ "questions": questions })
 }
 
 /// 拒掉确认 / 取消提问后 opencode 会停下这次执行：等它停下再发新的话（最多 5 秒）
@@ -885,7 +970,7 @@ fn waiting_in_opencode(be: &Backend, sid: &str, dir: Option<&str>) -> Option<sto
     if let Ok((200, v)) = oc::get(&be.conn, &format!("/api/session/{sid}/form"), dir) {
         if let Some(form) = v["data"].as_array().into_iter().flatten().find(|f| pending(f)) {
             let call = form["metadata"]["tool"]["id"].as_str().unwrap_or("");
-            let tool = (!call.is_empty()).then(|| json!({ "id": call, "name": "question", "title": tool_label("question") }));
+            let tool = (!call.is_empty()).then(|| json!({ "id": call, "name": "question", "title": tool_label("question"), "input": question_input(form) }));
             backend::log(&format!("session {sid} 还有没答的提问 {}", form["id"].as_str().unwrap_or("")));
             return Some(store::Pending { request: form["id"].as_str().unwrap_or("").to_string(), tool, form: Some(form.clone()) });
         }
@@ -1057,6 +1142,30 @@ mod tests {
         assert_eq!(a, json!({ "q0": "你看着办，越详细越好", "q1": ["你看着办，越详细越好"] }));
         // 跳过的题不答
         assert_eq!(form_answer(&form(), "中文；（跳过）"), Some(json!({ "q0": "中文" })));
+    }
+
+    #[test]
+    fn question_input_from_form() {
+        // 重开过的 Friday 照它重新画选项卡片：问题、选项、多选都在
+        let f = json!({ "fields": [
+            { "key": "q0", "title": "语言", "description": "报告用什么语言？", "type": "string", "options": [{ "value": "zh", "label": "中文", "description": "默认" }, { "value": "en", "label": "英文" }] },
+            { "key": "q1", "title": "附件", "description": "", "type": "multiselect", "options": [{ "value": "表格", "label": "表格" }] },
+            { "key": "x", "type": "external" },
+        ] });
+        let input = question_input(&f);
+        assert_eq!(input["questions"].as_array().map(Vec::len), Some(2));
+        assert_eq!(input["questions"][0]["question"], "报告用什么语言？");
+        assert_eq!(input["questions"][0]["options"][0], json!({ "label": "中文", "description": "默认" }));
+        assert_eq!(input["questions"][0]["multiple"], false);
+        assert_eq!((input["questions"][1]["question"].clone(), input["questions"][1]["multiple"].clone()), (json!("附件"), json!(true)));
+    }
+
+    #[test]
+    fn continuing_flag_parsed() {
+        let body = json!({ "model": "opencode/x", "messages": [{ "role": "user", "content": "（上一步因出错中断：超时。）" }], "x_friday": { "session": "s", "continuing": true } });
+        assert!(parse(&body).unwrap().continuing);
+        let body = json!({ "model": "opencode/x", "messages": [{ "role": "user", "content": "中文" }], "x_friday": { "session": "s" } });
+        assert!(!parse(&body).unwrap().continuing);
     }
 
     #[test]

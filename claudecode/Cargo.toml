@@ -1,6 +1,6 @@
 [package]
 name = "friday-claudecode"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Friday 的 Claude Code 能力：把用户自己装的 Claude Code（claude 命令行）接成 OpenAI 兼容的流式接口"
 license = "MIT"

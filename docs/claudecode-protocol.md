@@ -61,6 +61,8 @@ stdin 关了就停掉所有 claude 再退出。
     - `full`（完全）→ `bypassPermissions`：都不问。
   - `toolEvents`：`true` = Friday 认结构化的工具事件（见下）；没有（旧版 Friday）就写进思考区（`▸ 运行命令 …` / `  ✓ …` / `  ✗ …`）。
   - `questions`（0.1.1，Friday 2.97.25 起）：`true` = Friday 把等回答的提问行（`AskUserQuestion`）画成选项卡片，提问时正文不再列问题。
+  - `continuing`（0.1.2，Friday 2.97.26 起）：`true` = 这句是 Friday 自己接着做的话（出错后自动恢复、点了重试、换了模型接着做），不是用户说的：
+    还在等的提问 / 确认不拿它当回答，那一行再发一次 `waiting`、正文同第一次问时，这次回答到此结束（claude 那边照旧停着等）。
 - 流式输出：主智能体的文字 → `content`；思考 → `reasoning_content`（只在有字时：现在的模型思考块是空的）；最后一块带 `usage`
   （`prompt_tokens` = 最后一次调用的 input + cache_read + cache_creation，`completion_tokens` = 各轮 output 相加），
   和顶层 `x_friday.rateLimit`（最近的 `rate_limit_info`，Friday 不认就忽略）。
@@ -84,7 +86,7 @@ stdin 关了就停掉所有 claude 再退出。
   - `AskUserQuestion`：工具行 `waiting`「等你回答」（没有 `questions` 时正文列出问题和选项），用户下一句就是回答：几题用「；」隔开
     （段数对不上就整句当每一题的回答），每段写选项名或序号，多选用「、」或逗号，对不上的原样当自己写的，「（跳过）」= 这题不答；
     以放行交回（0.1.1；同 Agent SDK：`{"behavior":"allow","updatedInput":{…原参数, "answers": {"<问题>": "<选项名>"}}}`，多选用「, 」连），
-    它的提问工具照常成功（结果是「User has answered your questions: …」）。
+    它的提问工具照常成功（结果是「User has answered your questions: …」）；0.1.2 起它做完不再报给 Friday（那一行已经记着「回答：…」）。
 - 出错：还没写出任何内容时回 HTTP 错误码——额度用完（`rate_limit_event` 的 `status` 是 `rejected`，或文字「hit your … limit」，或 API 429）→ **429**，
   `Retry-After` = `resetsAt` − 现在（只有订阅登录时 Claude Code 才报 `rate_limit_event`；用 API 密钥时没有重置时间，不带 Retry-After）；
   没登录 / 登录过期 → **401**，说要在终端运行 `claude auth login`；Claude 太忙（529）→ 503；其它 → 502。

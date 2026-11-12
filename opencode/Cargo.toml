@@ -1,6 +1,6 @@
 [package]
 name = "friday-opencode"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "Friday 的 opencode 能力：把本机 opencode 自己的智能体接成 OpenAI 兼容的流式接口"
 license = "MIT"

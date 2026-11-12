@@ -44,6 +44,9 @@
     - `full`（完全）：都不问。
   - `toolEvents`：`true` = Friday 认结构化的工具事件（见下），工具活动画成 Friday 原生的工具行；没有（旧版 Friday）就写进思考区。
   - `questions`（0.1.2，Friday 2.97.25 起）：`true` = Friday 把等回答的提问行画成选项卡片，提问时正文不再列问题。
+  - `continuing`（0.1.3，Friday 2.97.26 起）：`true` = 这句是 Friday 自己接着做的话（出错后自动恢复、点了重试、换了模型接着做），不是用户说的。
+    这时还在等的提问 / 确认**不拿它当回答**：提问那一行再发一次 `waiting`（带 `input.questions`，没见过参数就按表单补，重开过的 Friday 照它重画卡片）、
+    确认同样再问一次，这次回答到此结束；没有在等的就照常把这句话发给 OpenCode。
 - 流式输出：文字 → `content`；OpenCode 的思考 → `reasoning_content`；最后一块带 `usage`
   （`prompt_tokens` = 最后一步的上下文长度，输出各步相加）。工具活动：
   - `toolEvents` 时：单独一块，`delta` 为空、顶层 `x_friday.tool`：
@@ -65,6 +68,8 @@
   每段写选项名或序号（「2」「第二个」），多选用「、」或逗号隔开，对不上选项的原样当自己写的，「（跳过）」= 这题不答；
   填成 `{"q0": "中文", "q1": ["表格", "摘要"]}` 回 `POST /api/session/<id>/form/<表单 id>/reply {"answer": …}`，OpenCode 接着做，内容接着流回来。
   填不进去（选项外的回答而这题不许自己写、表单已经没了）→ 取消表单（`DELETE …/form/<id>`）、停下这次执行，再把这句话当新的话发。
+  答过的提问之后 OpenCode 报它做完（`session.tool.success` / `failed`）不再转给 Friday（0.1.3：Friday 那一行已经记着「回答：…」，
+  再报会盖掉；Friday 重开过的还会多出一行空参数的）。
 - 等确认 / 等回答记在内存里；本程序重启过（闲置 15 分钟被停）时，下一句话进来先问 OpenCode 这段会话有没有还在等的
   （`GET /api/session/<id>/form`、`…/permission`，只列没答的），有就照上面处理，不会把回答当成新的话排在一直等着的表单后面。
 - 出错：还没写出任何内容时回 HTTP 错误码（OpenCode 报的 `status`，如 429 免费额度用完 / 402 余额不足），

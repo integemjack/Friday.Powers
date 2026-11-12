@@ -8,6 +8,8 @@
 //!   permission  Friday 会话框下的权限档：auto（默认：改工作目录里的文件不问，跑命令等先问）| plan（只读）| full（都不问）
 //!   toolEvents  Friday 认结构化的工具事件（x_friday.tool）
 //!   questions   Friday 把等回答的提问行（AskUserQuestion）画成选项卡片（v2.97.25 起）：提问时正文不再列一遍问题
+//!   continuing  这句是 Friday 自己接着做的话（出错后自动恢复、点了重试、换了模型接着做），不是用户说的：
+//!               还在等的提问 / 确认不拿它当回答，原样再交回去（工具行再标一次等回答，这次到此为止）
 //! 要用户确认的操作：这次回答以一句说明结束，claude 那边停着等；用户下一句说「允许」/「总是允许」就放行并接着把后面的内容流回来，
 //! 说别的就拒绝、再把这句话当成新的一句交给它。
 
@@ -44,6 +46,8 @@ struct Ask {
     tool_events: bool,
     /// Friday 把等回答的提问行画成选项卡片（x_friday.questions）
     questions: bool,
+    /// 这句是 Friday 自己接着做的话（x_friday.continuing）：不是对提问 / 确认的回答
+    continuing: bool,
 }
 
 fn text_of(content: &Value) -> String {
@@ -143,6 +147,7 @@ fn parse(body: &Value) -> Result<Ask, String> {
     .to_string();
     let tool_events = xf["toolEvents"].as_bool().unwrap_or(false);
     let questions = xf["questions"].as_bool().unwrap_or(false);
+    let continuing = xf["continuing"].as_bool().unwrap_or(false);
     let messages: Vec<Value> = body["messages"].as_array().cloned().unwrap_or_default();
     let Some(last_user) = messages.iter().rposition(|m| m["role"].as_str() == Some("user")) else {
         return Err("messages 里没有用户的话".into());
@@ -184,7 +189,7 @@ fn parse(body: &Value) -> Result<Ask, String> {
     if text.trim().is_empty() && images.is_empty() {
         return Err("最后一句用户的话是空的".into());
     }
-    Ok(Ask { model, key, dir, permission, text, said, images, history, tool_events, questions })
+    Ok(Ask { model, key, dir, permission, text, said, images, history, tool_events, questions, continuing })
 }
 
 fn content(text: &str, images: &[Value]) -> Value {
@@ -717,6 +722,14 @@ fn conversation(bin: &Path, ask: &Ask, out: &mut Out) -> Pumped {
     let r = (|| {
         if let Some(pending) = asked {
             if conv.alive(&mut p) {
+                if ask.continuing {
+                    // Friday 自己接着做的话（出错后自动恢复、点了重试）不是回答：还在等的提问 / 确认原样再交回去，这次到此为止
+                    backend::log(&format!("key={} 还在等 {} {}，这句是 Friday 接着做的话：再交回去", conv::short(&ask.key), pending.id, pending.tool));
+                    let structured = ask.tool_events && out.streaming;
+                    show_ask(&mut p, ask, out, structured, &pending.id, &pending.tool, &pending.input);
+                    conv.pending.lock().unwrap().insert(0, pending);
+                    return Pumped::default();
+                }
                 if let Err(e) = answer(&conv, &mut p, ask, pending) {
                     return Pumped::failed(502, "claude_error", e);
                 }
@@ -765,6 +778,8 @@ fn answer(conv: &Conv, p: &mut Proc, ask: &Ask, pending: Pending) -> Result<(), 
         let mut input = if pending.input.is_object() { pending.input.clone() } else { json!({}) };
         input["answers"] = question_answers(&pending.input, &words);
         backend::log(&format!("question {} → {}", pending.id, input["answers"]));
+        // 它做完不再报（Friday 那一行已经记着「回答：…」，再报会盖掉；Friday 重开过的还会多出一行）
+        p.tools.remove(&pending.id);
         let _ = pending.reply.send(conv::allow_json(&input));
         return Ok(());
     }
@@ -1125,17 +1140,24 @@ fn ask_user(conv: &Conv, p: &mut Proc, ask: &Ask, out: &mut Out, structured: boo
         pending[i].asked = true;
         (pending[i].tool.clone(), pending[i].input.clone())
     };
+    show_ask(p, ask, out, structured, id, &tool, &input);
+    backend::log(&format!("permission asked key={} id={id} tool={tool}", conv::short(&conv.key)));
+    true
+}
+
+/// 在对话里问用户：工具行标成等回答 / 等确认，正文（没画卡片时）列出问题或要做的事
+fn show_ask(p: &mut Proc, ask: &Ask, out: &mut Out, structured: bool, id: &str, tool: &str, input: &Value) {
     let base = match p.tools.get(id) {
         Some(b) => b.clone(),
         None => {
-            let b = json!({ "id": id, "name": tool, "title": title(&tool), "summary": summary(&tool, &input, &ask.dir), "input": relative(&input, &ask.dir) });
+            let b = json!({ "id": id, "name": tool, "title": title(tool), "summary": summary(tool, input, &ask.dir), "input": relative(input, &ask.dir) });
             p.tools.insert(id.to_string(), b.clone());
             b
         }
     };
     let question = tool == "AskUserQuestion";
     if structured {
-        let note = if question { "等你回答".to_string() } else { format!("等你确认：{}", permission_label(&tool)) };
+        let note = if question { "等你回答".to_string() } else { format!("等你确认：{}", permission_label(tool)) };
         out.tool(with(&base, json!({ "status": "waiting", "output": note })));
     }
     let text = if question && structured && ask.questions {
@@ -1163,7 +1185,7 @@ fn ask_user(conv: &Conv, p: &mut Proc, ask: &Ask, out: &mut Out, structured: boo
     } else if structured {
         format!(
             "\n\nClaude Code 想{}，等你确认：点上面的「允许执行」或回复「允许」（「总是允许」以后同类不再问）；回复别的就取消，按你新说的做。",
-            permission_label(&tool)
+            permission_label(tool)
         )
     } else {
         let detail = match input["command"].as_str() {
@@ -1172,15 +1194,13 @@ fn ask_user(conv: &Conv, p: &mut Proc, ask: &Ask, out: &mut Out, structured: boo
         };
         format!(
             "\n\n> **Claude Code 想{}**\n\n```\n{}\n```\n\n回复「允许」放行这一次，回复「总是允许」以后同类操作不再问；回复别的就取消，按你新说的做。",
-            permission_label(&tool),
+            permission_label(tool),
             detail
         )
     };
     if !text.is_empty() {
         out.emit(json!({ "content": text }));
     }
-    backend::log(&format!("permission asked key={} id={id} tool={tool}", conv::short(&conv.key)));
-    true
 }
 
 fn finish(out: &mut Out, ask: &Ask, r: Pumped) {

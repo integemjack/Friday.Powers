@@ -5,7 +5,7 @@
 //! 宿主协议见 docs/power-spec.md §2：
 //!   friday-claudecode serve --host 127.0.0.1 --port 0 --data-dir <目录> [--token <串>] [--parent-stdin]
 //! 就绪后 stdout 打一行 {"event":"listening","url":…}；--parent-stdin 时 stdin 关了就退出（拉起的 claude 一起停）。
-//! 接口：GET /health、GET /v1/info、GET /v1/models、POST /v1/chat/completions（见 chat.rs）；
+//! 接口：GET /health、GET /v1/info、GET /v1/models、GET /v1/usage（额度）、POST /v1/chat/completions（见 chat.rs）；
 //! 内部：POST /internal/permission（mcp 子命令转来的权限确认，见 conv.rs）。
 //! 子命令 `mcp`：claude 的 --permission-prompt-tool 用的 MCP 服务（stdio），见 mcp.rs。
 //! 测试用：FRIDAY_CLAUDE_BIN 指定 claude；CLAUDE_CONFIG_DIR / ANTHROPIC_BASE_URL 等照常传给 claude。
@@ -126,6 +126,7 @@ fn serve(args: &[String]) {
             let _ = backend::auth(&bin);
             let _ = backend::flags(&bin);
             let _ = backend::models(&bin);
+            let _ = backend::catalog();
         }
     });
     std::thread::spawn(conv::reaper);
@@ -156,31 +157,91 @@ fn info() -> Value {
     })
 }
 
-/// 模型列表不写死：问 Claude Code 自己（backend::models，initialize 回的 models），它更新了新模型、换了默认这里跟着变。
-/// 每个模型：id = --model 的值（default 不传 --model，用 Claude Code 自己的默认）、name、description（Claude Code 的说明）、
-/// resolved_model（default 这类别名现在指哪个）、efforts（能选的思考档 = --effort 的值；空 = 不分档，只能开 / 关思考）
+/// 模型列表不写死：先是 Claude Code 自己报的（backend::models，initialize 回的 models：它 /model 里常用的那几个，default 不传 --model），
+/// 再加公开模型目录（backend::catalog）里它没列的具体版本（Opus 4.7、Sonnet 4.6……；按登录方式 offered_on 过滤，要更新 Claude Code 才能用的
+/// 不列、写进 backend.detail）。每个模型：id = --model 的值、name、description、resolved_model、efforts（能选的思考档；空 = 只能开 / 关）、
+/// group（main 常用 / overflow 其他版本）
 fn models() -> Result<Value, (u16, String)> {
     let bin = backend::find_binary().ok_or((503, backend::NOT_FOUND.to_string()))?;
     let version = backend::version(&bin).unwrap_or_default();
     let auth = backend::auth(&bin);
     let logged_in = auth.as_ref().map(|a| a["loggedIn"].as_bool() == Some(true)).unwrap_or(false);
     let plan = auth.as_ref().map(|a| a["authMethod"].as_str() == Some("claude.ai")).unwrap_or(false);
+    let provider = match auth.as_ref().and_then(|a| a["apiProvider"].as_str()).unwrap_or("") {
+        "bedrock" => "bedrock",
+        "vertex" => "vertex",
+        "foundry" => "foundry",
+        _ => "first_party",
+    };
     let (list, stale) = backend::models(&bin).map_err(|e| (502, e))?;
-    let data: Vec<Value> = list.iter().filter_map(|m| model_entry(m, plan)).collect();
+    let mut data: Vec<Value> = list.iter().filter_map(|m| model_entry(m, plan)).collect();
+    let base = |id: &str| id.trim().to_lowercase().trim_end_matches("[1m]").to_string();
+    let mut covered: std::collections::HashSet<String> = list
+        .iter()
+        .flat_map(|m| [m["value"].as_str().unwrap_or(""), m["resolvedModel"].as_str().unwrap_or("")])
+        .filter(|id| !id.is_empty())
+        .map(base)
+        .collect();
+    let mut needs_update: Vec<String> = Vec::new();
+    for m in backend::catalog() {
+        let Some(id) = m["id"].as_str().map(str::trim).filter(|s| !s.is_empty()) else { continue };
+        let section = m["section"].as_str().unwrap_or("main");
+        if section == "deprecated" || m["disabled"].as_bool() == Some(true) || covered.contains(&base(id)) {
+            continue;
+        }
+        if let Some(offered) = m["offered_on"].as_array() {
+            if !offered.iter().any(|p| p == provider) {
+                continue;
+            }
+        }
+        let name = m["name"].as_str().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(id);
+        if let Some(min) = m["min_claude_code_version"].as_str() {
+            if !version.is_empty() && backend::older(&version, min) {
+                needs_update.push(name.to_string());
+                continue;
+            }
+        }
+        let efforts: Vec<String> = match m["runtime"]["effort_levels"].as_array() {
+            Some(levels) => levels.iter().filter_map(Value::as_str).map(str::to_string).collect(),
+            None => m["thinking"]["effort_options"].as_array().into_iter().flatten().filter_map(|o| o["id"].as_str()).map(str::to_string).collect(),
+        };
+        let efforts: Vec<String> = efforts.into_iter().filter(|l| conv::is_word(l)).collect();
+        covered.insert(base(id));
+        data.push(json!({
+            "id": id,
+            "object": "model",
+            "owned_by": "claudecode",
+            "name": name,
+            "description": m["description"].as_str().unwrap_or(""),
+            "resolved_model": id,
+            "efforts": efforts,
+            "group": if section == "overflow" { "overflow" } else { "main" },
+            "input_modalities": ["text", "image"],
+            "tools": true,
+            "free": false,
+            "billing": if plan { "plan" } else { "metered" },
+        }));
+    }
     let mut detail = backend::detail(&version, auth.as_ref());
+    if !needs_update.is_empty() {
+        detail.push_str(&format!(" · 更新 Claude Code 后还能选：{}", needs_update.join("、")));
+    }
     if stale {
         detail.push_str(" · 模型列表是上次取到的");
     }
     Ok(json!({
         "object": "list",
         "data": data,
-        "backend": { "detail": detail, "version": version, "loggedIn": logged_in, "path": bin.to_string_lossy(), "stale": stale },
+        "backend": { "detail": detail, "version": version, "loggedIn": logged_in, "path": bin.to_string_lossy(), "stale": stale, "needsUpdate": needs_update },
     }))
 }
 
-/// Claude Code 报的一个模型 → /v1/models 的一项
+/// Claude Code 报的一个模型 → /v1/models 的一项（它自己列的都算常用）
 fn model_entry(m: &Value, plan: bool) -> Option<Value> {
     let id = m["value"].as_str().map(str::trim).filter(|s| !s.is_empty())?;
+    if m["disabled"].as_bool() == Some(true) {
+        return None;
+    }
     let name = if id == "default" { "默认" } else { m["displayName"].as_str().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(id) };
     let efforts: Vec<&str> = if m["supportsEffort"].as_bool() == Some(true) {
         m["supportedEffortLevels"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|l| conv::is_word(l)).collect()
@@ -196,6 +257,7 @@ fn model_entry(m: &Value, plan: bool) -> Option<Value> {
         "resolved_model": m["resolvedModel"].as_str().unwrap_or(""),
         "efforts": efforts,
         "adaptive_thinking": m["supportsAdaptiveThinking"].as_bool().unwrap_or(false),
+        "group": "main",
         "input_modalities": ["text", "image"],
         "tools": true,
         "free": false,
@@ -203,9 +265,17 @@ fn model_entry(m: &Value, plan: bool) -> Option<Value> {
     }))
 }
 
+/// 额度（GET /v1/usage[?fresh=1]）：claude 的 get_usage 换成 Friday 的额度报告（backend::usage）；没装 claude 503，问不到 502
+fn usage(fresh: bool) -> Result<Value, (u16, String)> {
+    let bin = backend::find_binary().ok_or((503, backend::NOT_FOUND.to_string()))?;
+    backend::usage(&bin, fresh).map_err(|e| (502, e))
+}
+
 fn handle(mut stream: TcpStream, token: &str) {
     let Ok(Some(req)) = http::read_request(&stream) else { return };
-    let path = req.path.trim_end_matches('/').to_string();
+    let (path, query) = req.path.split_once('?').unwrap_or((req.path.as_str(), ""));
+    let path = path.trim_end_matches('/').to_string();
+    let query = query.to_string();
     // 内部接口：只给本程序拉起的 mcp 子命令用（它带的是内部口令，不是宿主的 token）
     if path == "/internal/permission" {
         let (_, internal) = backend::server();
@@ -233,6 +303,15 @@ fn handle(mut stream: TcpStream, token: &str) {
             let _ = http::json(&mut stream, 200, &info());
         }
         ("GET", "/v1/models") => match models() {
+            Ok(v) => {
+                let _ = http::json(&mut stream, 200, &v);
+            }
+            Err((status, e)) => {
+                let code = if status == 503 { "claude_not_installed" } else { "claude_error" };
+                let _ = http::error(&mut stream, status, code, &e, &[]);
+            }
+        },
+        ("GET", "/v1/usage") => match usage(query.split('&').any(|kv| kv == "fresh=1")) {
             Ok(v) => {
                 let _ = http::json(&mut stream, 200, &v);
             }

@@ -2,7 +2,7 @@
   "schema": 2,
   "id": "claudecode",
   "title": "Claude Code",
-  "detail": "把你自己装的 Claude Code（Anthropic 的命令行编程智能体）接进来：模型菜单里多一组「Claude Code」，列的是你装的 Claude Code 自己报的模型（它更新出了新模型这里跟着有），思考档也按它每个模型能选的（关 / 低 / 中 / 高 / 超高 / 最高），能看到它思考的摘要。选了它的对话交给你本机的 Claude Code 原样去做——用它自己的提示词、工具、登录和额度（订阅或 API 密钥，Friday 不经手也不读你的登录凭据），在这段对话的工作目录里读写文件、跑命令，内容实时显示；要权限时在对话里问你（按会话框下的权限档：自动 = 改工作目录里的文件不问、跑命令先问，计划 = 只读，完全 = 都不问）。要先装好 Claude Code，并在终端运行 claude auth login 登录。",
+  "detail": "把你自己装的 Claude Code（Anthropic 的命令行编程智能体）接进来：模型菜单里多一组「Claude Code」，列的是你装的 Claude Code 自己报的模型，加上 Anthropic 公开模型目录里的具体版本（Opus 4.7、Sonnet 4.6……放在「更多版本」里；它们更新这里跟着变），思考档也按每个模型能选的（关 / 低 / 中 / 高 / 超高 / 最高），能看到它思考的摘要；最上面显示订阅的额度（5 小时、每周、各模型每周的用量和重置时间，和 Claude Code 的 /usage 一样）。选了它的对话交给你本机的 Claude Code 原样去做——用它自己的提示词、工具、登录和额度（订阅或 API 密钥，Friday 不经手也不读你的登录凭据），在这段对话的工作目录里读写文件、跑命令，内容实时显示；要权限时在对话里问你（按会话框下的权限档：自动 = 改工作目录里的文件不问、跑命令先问，计划 = 只读，完全 = 都不问）。要先装好 Claude Code，并在终端运行 claude auth login 登录。",
   "executable": "friday-claudecode",
   "serve": [
     "serve",

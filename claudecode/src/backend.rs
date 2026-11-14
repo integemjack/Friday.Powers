@@ -3,7 +3,9 @@
 //! 版本看 `claude --version`；登录状态只看 `claude auth status` 自己打印的 JSON，而且只留 loggedIn / authMethod / apiProvider / subscriptionType
 //! 四项（邮箱、组织 id 等一概不留）。本程序**不读、不碰** Claude Code 的登录凭据（钥匙串、~/.claude/.credentials.json、OAuth 令牌）。
 //! 拉起 claude 时继承本程序的环境，但去掉从上层 Claude Code 会话漏下来的 CLAUDECODE、CLAUDE_CODE_* 等（带着它们 claude 会认错登录）。
-//! 模型列表不写死：问 claude 自己（流式输入的 initialize 控制请求，见 models()），Claude Code 更新出了新模型、换了默认，这里跟着变。
+//! 模型列表不写死：问 claude 自己（流式输入的 initialize 控制请求，见 models()），Claude Code 更新出了新模型、换了默认，这里跟着变；
+//! 具体版本（Opus 4.7、Sonnet 4.6 这些 Claude Code 的 /model 里「更多」那一组）取 Anthropic 公开的 Claude Code 模型目录（catalog()）。
+//! 额度：claude 的 get_usage 控制请求（就是 /usage 的数据，claude 用它自己的登录去查），见 usage()。
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -29,6 +31,10 @@ struct State {
     flags: Option<(PathBuf, Option<SystemTime>, Flags)>,
     /// Claude Code 报的模型（60 秒）：（程序路径, 修改时间, 取到的时候, 模型）
     models: Option<(PathBuf, Option<SystemTime>, Instant, Vec<Value>)>,
+    /// 公开的模型目录里 Claude Code 那一份的模型（6 小时）
+    catalog: Option<(Instant, Vec<Value>)>,
+    /// get_usage 的结果（30 秒）
+    usage: Option<(Instant, Value)>,
 }
 
 fn state() -> &'static Mutex<State> {
@@ -42,6 +48,8 @@ fn state() -> &'static Mutex<State> {
             auth: None,
             flags: None,
             models: None,
+            catalog: None,
+            usage: None,
         })
     })
 }
@@ -351,6 +359,15 @@ pub fn models(bin: &Path) -> Result<(Vec<Value>, bool), String> {
 }
 
 fn ask_models(bin: &Path) -> Result<Vec<Value>, String> {
+    let answer = control(bin, json!({ "subtype": "initialize" }), 30)?;
+    match answer["models"].as_array() {
+        Some(list) if !list.is_empty() => Ok(list.clone()),
+        _ => Err("Claude Code 没报模型".into()),
+    }
+}
+
+/// 起一个只用来问话的 claude（不留会话、不要工具），发一个控制请求，等它回（最多 secs 秒），回的 response 就是结果；问完就停
+pub fn control(bin: &Path, request: Value, secs: u64) -> Result<Value, String> {
     let mut cmd = command(bin);
     cmd.args(QUIET).current_dir(work_dir()).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("拉起 {} 失败：{e}", bin.display()))?;
@@ -372,17 +389,19 @@ fn ask_models(bin: &Path) -> Result<Vec<Value>, String> {
             }
         }
     });
-    let request = json!({ "type": "control_request", "request_id": "friday-models", "request": { "subtype": "initialize" } });
-    let wrote = writeln!(stdin, "{request}").and_then(|_| stdin.flush());
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut answer: Result<Vec<Value>, String> = Err("Claude Code 没有回 initialize".into());
+    let subtype = request["subtype"].as_str().unwrap_or("").to_string();
+    let id = format!("friday-{subtype}");
+    let line = json!({ "type": "control_request", "request_id": id, "request": request });
+    let wrote = writeln!(stdin, "{line}").and_then(|_| stdin.flush());
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let mut answer: Result<Value, String> = Err(format!("Claude Code 没回 {subtype}"));
     if let Err(e) = wrote {
         answer = Err(format!("写不进 claude：{e}"));
     } else {
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                answer = Err("等 Claude Code 回 initialize 超时（30 秒）".into());
+                answer = Err(format!("等 Claude Code 回 {subtype} 超时（{secs} 秒）"));
                 break;
             }
             let Ok(v) = rx.recv_timeout(left.min(Duration::from_millis(500))) else {
@@ -391,15 +410,12 @@ fn ask_models(bin: &Path) -> Result<Vec<Value>, String> {
                 }
                 continue;
             };
-            if v["type"].as_str() != Some("control_response") || v["response"]["request_id"].as_str() != Some("friday-models") {
+            if v["type"].as_str() != Some("control_response") || v["response"]["request_id"].as_str() != Some(id.as_str()) {
                 continue;
             }
             let r = &v["response"];
             answer = if r["subtype"].as_str() == Some("success") {
-                match r["response"]["models"].as_array() {
-                    Some(list) if !list.is_empty() => Ok(list.clone()),
-                    _ => Err("Claude Code 没报模型".into()),
-                }
+                Ok(r["response"].clone())
             } else {
                 Err(r["error"].as_str().unwrap_or("Claude Code 回了出错").to_string())
             };
@@ -414,6 +430,187 @@ fn ask_models(bin: &Path) -> Result<Vec<Value>, String> {
         Some(last) => format!("{e}（{}）", last.chars().take(200).collect::<String>()),
         None => e,
     })
+}
+
+/// Anthropic 公开的模型目录（Claude Code 自己的 /model 也用它；签过名的公开文件，不用登录）
+pub const CATALOG_URL: &str = "https://downloads.claude.ai/model-catalog/v1/catalog.json";
+
+/// 公开目录里 Claude Code（surface cc）那一份的模型：[{id, name, description, section（main / overflow / deprecated）,
+/// runtime.effort_levels, min_claude_code_version, offered_on…}]。6 小时内用缓存；取到的存进 <data-dir>/catalog.json，取不到用存下的；
+/// 都没有返回空（只列 Claude Code 自己报的那几个）
+pub fn catalog() -> Vec<Value> {
+    if let Some((at, list)) = &state().lock().unwrap().catalog {
+        if at.elapsed() < Duration::from_secs(6 * 3600) {
+            return list.clone();
+        }
+    }
+    let saved = data_dir().join("catalog.json");
+    let fetched = fetch_catalog();
+    let list = match fetched {
+        Ok(list) => {
+            let _ = std::fs::write(&saved, Value::Array(list.clone()).to_string());
+            list
+        }
+        Err(e) => {
+            log(&format!("取模型目录失败：{e}"));
+            std::fs::read_to_string(&saved).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v.as_array().cloned()).unwrap_or_default()
+        }
+    };
+    // 取不到时也记一下，6 小时内不再试（每次问模型都等它会拖慢菜单）
+    state().lock().unwrap().catalog = Some((Instant::now(), list.clone()));
+    list
+}
+
+fn fetch_catalog() -> Result<Vec<Value>, String> {
+    if let Ok(path) = std::env::var("FRIDAY_CLAUDE_CATALOG") {
+        // 测试用：本地文件
+        let text = std::fs::read_to_string(&path).map_err(|e| format!("读 {path} 失败：{e}"))?;
+        return parse_catalog(&text);
+    }
+    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(20))).http_status_as_error(false).build().into();
+    let mut response = agent.get(CATALOG_URL).header("User-Agent", format!("friday-claudecode/{}", env!("CARGO_PKG_VERSION"))).call().map_err(|e| e.to_string())?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {status}"));
+    }
+    let text = response.body_mut().with_config().limit(8 << 20).read_to_string().map_err(|e| e.to_string())?;
+    parse_catalog(&text)
+}
+
+fn parse_catalog(text: &str) -> Result<Vec<Value>, String> {
+    let doc: Value = serde_json::from_str(text).map_err(|e| format!("模型目录不是 JSON：{e}"))?;
+    let configs = doc["surfaces"]["cc"]["model_selector_config"].as_array().ok_or("模型目录里没有 Claude Code 那一份")?;
+    let config = configs.iter().find(|c| c["id"] == "cc").or(configs.first()).ok_or("模型目录里没有 Claude Code 那一份")?;
+    Ok(config["models"].as_array().cloned().unwrap_or_default())
+}
+
+/// 版本号比大小（「2.1.276」）：a 比 b 旧
+pub fn older(a: &str, b: &str) -> bool {
+    let parts = |v: &str| v.split(|c: char| !c.is_ascii_digit()).filter(|p| !p.is_empty()).map(|p| p.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
+    parts(a) < parts(b)
+}
+
+/// 额度：claude 的 get_usage（/usage 的数据，claude 用它自己的登录去查；skip_behaviors 不扫本机记录），换成 Friday 的额度报告：
+/// {report: {plan, subscription, windows: [{title, remainingPercent, resetAt}], warnings?, fetchedAt}, available}。30 秒内用缓存
+pub fn usage(bin: &Path, fresh: bool) -> Result<Value, String> {
+    if !fresh {
+        if let Some((at, v)) = &state().lock().unwrap().usage {
+            if at.elapsed() < Duration::from_secs(30) {
+                return Ok(v.clone());
+            }
+        }
+    }
+    let answer = control(bin, json!({ "subtype": "get_usage", "skip_behaviors": true }), 40)?;
+    let v = usage_report(&answer);
+    state().lock().unwrap().usage = Some((Instant::now(), v.clone()));
+    Ok(v)
+}
+
+/// get_usage 的回答 → Friday 的额度报告（ServiceUsage.Report 的 JSON）
+pub fn usage_report(answer: &Value) -> Value {
+    let limits = &answer["rate_limits"];
+    let mut windows: Vec<Value> = Vec::new();
+    let mut push = |title: String, percent: Option<f64>, resets: Option<&str>| {
+        let Some(percent) = percent else { return };
+        let mut w = json!({ "title": title, "remainingPercent": (100.0 - percent).clamp(0.0, 100.0) });
+        if let Some(at) = resets.and_then(iso_seconds) {
+            w["resetAt"] = json!(at);
+        }
+        windows.push(w);
+    };
+    if let Some(list) = limits["limits"].as_array().filter(|l| !l.is_empty()) {
+        // 新版的统一列表：session（5 小时）、weekly_all（每周）、weekly_scoped（某个模型的每周）……
+        for item in list {
+            let kind = item["kind"].as_str().unwrap_or("");
+            let scope = item["scope"]["model"]["display_name"].as_str().or(item["scope"]["surface"].as_str()).unwrap_or("");
+            let title = match kind {
+                "session" => "5 小时".to_string(),
+                "weekly_all" => "每周".to_string(),
+                "weekly_scoped" if !scope.is_empty() => format!("每周 {scope}"),
+                _ if !scope.is_empty() => format!("{kind} {scope}"),
+                _ => kind.to_string(),
+            };
+            push(title, item["percent"].as_f64(), item["resets_at"].as_str());
+        }
+    } else if limits.is_object() {
+        for (key, title) in [("five_hour", "5 小时"), ("seven_day", "每周"), ("seven_day_opus", "每周 Opus"), ("seven_day_sonnet", "每周 Sonnet")] {
+            push(title.to_string(), limits[key]["utilization"].as_f64(), limits[key]["resets_at"].as_str());
+        }
+        for item in limits["model_scoped"].as_array().into_iter().flatten() {
+            push(format!("每周 {}", item["display_name"].as_str().unwrap_or("")), item["utilization"].as_f64(), item["resets_at"].as_str());
+        }
+    }
+    let extra = &limits["extra_usage"];
+    if extra["is_enabled"].as_bool() == Some(true) {
+        push("额外用量".to_string(), extra["utilization"].as_f64(), None);
+    }
+    let plan = answer["subscription_type"].as_str().filter(|s| !s.is_empty()).map(|s| {
+        let mut c = s.chars();
+        c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+    });
+    let available = answer["rate_limits_available"].as_bool().unwrap_or(false);
+    let mut report = json!({ "balances": [], "windows": windows, "freeTier": false, "fetchedAt": iso_seconds_now() });
+    if let Some(plan) = &plan {
+        report["plan"] = json!(plan);
+        report["subscription"] = json!(true);
+    }
+    json!({ "report": report, "available": available, "plan": plan })
+}
+
+/// 「2026-11-14T12:10:00.079912+00:00」→「2026-11-14T12:10:00Z」（Friday 解 ISO 8601 时不认小数秒和时区偏移）
+fn iso_seconds(text: &str) -> Option<String> {
+    let text = text.trim();
+    let (date, rest) = text.split_once('T')?;
+    let time = rest.get(..8)?;
+    let tail = &rest[8..];
+    let tail = tail.trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
+    let offset_minutes: i64 = match tail {
+        "" | "Z" | "z" | "+00:00" | "-00:00" => 0,
+        t if t.len() >= 6 && (t.starts_with('+') || t.starts_with('-')) => {
+            let sign = if t.starts_with('-') { -1 } else { 1 };
+            let h: i64 = t[1..3].parse().ok()?;
+            let m: i64 = t[4..6].parse().ok()?;
+            sign * (h * 60 + m)
+        }
+        _ => return None,
+    };
+    let secs = unix_of(date, time)? - offset_minutes * 60;
+    Some(iso_of(secs))
+}
+
+fn iso_seconds_now() -> String {
+    iso_of(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0))
+}
+
+/// 「2026-11-14」「12:10:00」→ Unix 秒（UTC）
+fn unix_of(date: &str, time: &str) -> Option<i64> {
+    let mut d = date.split('-').map(|p| p.parse::<i64>().ok());
+    let (y, mo, da) = (d.next()??, d.next()??, d.next()??);
+    let mut t = time.split(':').map(|p| p.parse::<i64>().ok());
+    let (h, mi, se) = (t.next()??, t.next()??, t.next()??);
+    // 公历日期 → 自 1970-01-01 的天数（Howard Hinnant 的 days_from_civil）
+    let y2 = if mo <= 2 { y - 1 } else { y };
+    let era = if y2 >= 0 { y2 } else { y2 - 399 } / 400;
+    let yoe = y2 - era * 400;
+    let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + da - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(days * 86400 + h * 3600 + mi * 60 + se)
+}
+
+fn iso_of(secs: i64) -> String {
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
 /// 给人看的一句：「Claude Code 2.1.276 · Max 订阅」/「未登录：在终端运行 claude auth login」

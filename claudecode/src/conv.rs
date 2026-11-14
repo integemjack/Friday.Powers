@@ -46,9 +46,10 @@ pub struct Proc {
     pub child: Option<Child>,
     pub stdin: Option<ChildStdin>,
     pub rx: Option<Receiver<Value>>,
-    /// 起进程时的模型（请求里的 id）和 claude 的 --permission-mode
+    /// 起进程时的模型（请求里的 id）、claude 的 --permission-mode、思考档（x_friday.thinking，见 spawn）
     pub model: String,
     pub mode: String,
+    pub thinking: String,
     /// Claude Code 的 session_id（init 里报的；停了以后留着，下次 --resume）
     pub session: String,
     /// 这个进程是 --resume 起的；started = 见过 init（接回成功）
@@ -211,8 +212,11 @@ impl Conv {
         Ok(path)
     }
 
-    /// 拉起 claude。resume：接回的会话 id
-    pub fn spawn(&self, p: &mut Proc, bin: &Path, model: &str, mode: &str, resume: Option<&str>) -> Result<(), String> {
+    /// 拉起 claude。resume：接回的会话 id。
+    /// thinking（Friday 选的思考档）：空 = 不管（Claude Code 自己的设置）；off = 不想（MAX_THINKING_TOKENS=0）；on = 想、不指定档；
+    /// 其余是 --effort 的值（low / medium / high / xhigh / max…，按 /v1/models 报的这个模型能选的）。思考摘要（--thinking-display summarized）
+    /// 一直开着：无头模式默认只给签名、没有字，开了 Friday 才看得到它在想什么
+    pub fn spawn(&self, p: &mut Proc, bin: &Path, model: &str, mode: &str, thinking: &str, resume: Option<&str>) -> Result<(), String> {
         let mut args: Vec<String> = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--include-partial-messages", "--verbose"]
             .iter()
             .map(|s| s.to_string())
@@ -232,6 +236,15 @@ impl Conv {
             args.push("--model".into());
             args.push(model.to_string());
         }
+        let flags = backend::flags(bin);
+        if flags.effort && !matches!(thinking, "" | "off" | "on") {
+            args.push("--effort".into());
+            args.push(thinking.to_string());
+        }
+        if flags.display && thinking != "off" {
+            args.push("--thinking-display".into());
+            args.push("summarized".into());
+        }
         args.push("--permission-mode".into());
         args.push(mode.to_string());
         if let Some(id) = resume.filter(|s| !s.is_empty()) {
@@ -239,6 +252,16 @@ impl Conv {
             args.push(id.to_string());
         }
         let mut cmd = backend::command(bin);
+        match thinking {
+            "" => {}
+            "off" => {
+                cmd.env("MAX_THINKING_TOKENS", "0");
+            }
+            // 选了要想：用户环境里关思考的 MAX_THINKING_TOKENS=0 不带过去
+            _ => {
+                cmd.env_remove("MAX_THINKING_TOKENS");
+            }
+        }
         cmd.args(&args).current_dir(&self.dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         #[cfg(unix)]
         {
@@ -248,7 +271,7 @@ impl Conv {
         }
         let mut child = cmd.spawn().map_err(|e| format!("拉起 Claude Code 失败（{}）：{e}", bin.display()))?;
         backend::log(&format!(
-            "spawn key={} pid={} dir={} model={model} mode={mode} resume={}",
+            "spawn key={} pid={} dir={} model={model} mode={mode} thinking={thinking} resume={}",
             short(&self.key),
             child.id(),
             self.dir,
@@ -307,6 +330,7 @@ impl Conv {
         p.rx = Some(rx);
         p.model = model.to_string();
         p.mode = mode.to_string();
+        p.thinking = thinking.to_string();
         p.resumed = resume.map(|s| !s.is_empty()).unwrap_or(false);
         p.started = false;
         p.unanswered = 0;
@@ -620,4 +644,9 @@ mod tests {
         c.allow.lock().unwrap().insert("Bash".into());
         assert_eq!(decide(&c, "auto", "Bash", &json!({ "command": "ls" })).unwrap()["behavior"], "allow");
     }
+}
+
+/// 只有小写字母（思考档这种要原样当参数传给 claude 的值）
+pub fn is_word(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 16 && s.bytes().all(|b| b.is_ascii_lowercase())
 }

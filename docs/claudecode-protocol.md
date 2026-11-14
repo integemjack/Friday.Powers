@@ -2,7 +2,7 @@
 
 把用户**自己装的、原样不改的** Claude Code 命令行（`claude`，Anthropic）接进 Friday：模型菜单里多一组「Claude Code」；
 选了它的对话交给 **Claude Code 自己的智能体**（它自己的系统提示、工具、登录和额度）在这段对话的工作目录里做，内容实时流回 Friday。
-做法和 [opencode Power](opencode-protocol.md) 一样：Friday 只传用户的话，不跑自己的智能体循环。
+Friday 只传用户的话，不跑自己的智能体循环。模型列表、每个模型能选的思考档都问 Claude Code 自己（不写死），它更新出了新模型 Friday 这边跟着有。
 
 ## 0. 约束（必须守住）
 
@@ -37,13 +37,13 @@ stdin 关了就停掉所有 claude 再退出。
 |---|---|
 | `GET /health` | `{"status":"ok"}` |
 | `GET /v1/info` | `id`、`version`、`capabilities: ["agentChat"]`、`claude`（`path`、`version`）、`auth`（上面那四项）、`conversations`（记着几段对话）、`running`（常驻的 claude 进程数）、`active`（正在跑的对话请求数，宿主停闲置的 Power 之前看它）、`rateLimit`（最近一次见到的 `rate_limit_info`，没有为 null）、`error`（没找到 claude 时） |
-| `GET /v1/models` | 固定的列表（订阅能用哪些模型没有接口可查）：`default`（默认，不传 `--model`）、`fable`、`opus`、`sonnet`、`haiku`，`input_modalities: ["text","image"]`、`free: false`、`billing`（`authMethod` 是 `claude.ai` 时 `plan`，否则 `metered`）；顶层 `backend`：`detail`（「Claude Code 2.1.276 · Max 订阅」/「未登录：在终端运行 claude auth login」）、`version`、`loggedIn`。只有没装 claude 时回 503 |
+| `GET /v1/models` | **问 Claude Code 要**（0.2.0 起，不写死）：起一个 `claude -p --input-format stream-json --output-format stream-json --verbose --no-session-persistence --tools "" --strict-mcp-config`（`<data-dir>/work` 里），发流式输入的 `initialize` 控制请求（`{"type":"control_request","request_id":…,"request":{"subtype":"initialize"}}`，Agent SDK 的 `supportedModels()` 就是它），回的 `control_response` 里的 `models` 就是 Claude Code 自己 `/model` 里列的（跟着装的版本和登录的账号变，约 1 秒）。每项：`id`（= 它的 `value`，`--model` 的值：`default` 不传 `--model`、`opus[1m]`、`sonnet`、`haiku`、完整模型名…）、`name`（`displayName`；`default` 写「默认」）、`description`、`resolved_model`（别名现在指哪个）、`efforts`（`supportsEffort` 时的 `supportedEffortLevels`：`--effort` 能取的值，空 = 不分档，只能开 / 关思考）、`adaptive_thinking`，另有 `input_modalities: ["text","image"]`、`free: false`、`billing`（`authMethod` 是 `claude.ai` 时 `plan`，否则 `metered`）。60 秒内用缓存；取到的存进 `<data-dir>/models.json`，取不到时用存下的（`backend.stale: true`，`detail` 后面注明）。顶层 `backend`：`detail`（「Claude Code 2.1.276 · Max 订阅」/「未登录：在终端运行 claude auth login」）、`version`、`loggedIn`、`stale`。没装 claude 回 503，取不到又没有存下的回 502 |
 | `POST /v1/chat/completions` | OpenAI 兼容（流式 / 非流式），见下 |
 | `POST /internal/permission` | 内部：`mcp` 子命令转来的权限确认（带内部口令 `X-Friday-Internal`，不是宿主的 token），见 §3 |
 
 ### 2.1 chat/completions
 
-- `model`：上面的 id 之一（`claudecode/` 前缀也认；别的字符串原样当 `--model` 传，Claude Code 认完整模型名）。
+- `model`：`/v1/models` 报的 id 之一（`claudecode/` 前缀也认；别的字符串原样当 `--model` 传，Claude Code 认别名和完整模型名）。
 - **只用最后一句用户话**（文字 + `image_url` 图片：`data:` 地址转成 Anthropic 的 base64 image 块，网址转成 url image 块）；
   Friday 的系统提示、`tools` 都不传。
 - `x_friday`：
@@ -61,9 +61,14 @@ stdin 关了就停掉所有 claude 再退出。
     - `full`（完全）→ `bypassPermissions`：都不问。
   - `toolEvents`：`true` = Friday 认结构化的工具事件（见下）；没有（旧版 Friday）就写进思考区（`▸ 运行命令 …` / `  ✓ …` / `  ✗ …`）。
   - `questions`（0.1.1，Friday 2.97.25 起）：`true` = Friday 把等回答的提问行（`AskUserQuestion`）画成选项卡片，提问时正文不再列问题。
+  - `thinking`（0.2.0）：思考档。`off` = 不想（拉起时设环境变量 `MAX_THINKING_TOKENS=0`，请求里 `thinking: {type: disabled}`）；
+    `on` = 想、不指定档（不分档的模型，如 Haiku）；其余（`low` / `medium` / `high` / `xhigh` / `max`，按 `/v1/models` 里这个模型的 `efforts`）
+    → `--effort <档>`（请求里 `output_config.effort`）；选了要想时去掉环境里继承的 `MAX_THINKING_TOKENS`。没有 = 用 Claude Code 自己的设置。
+    和模型、权限档一样，变了就重开进程、`--resume` 接回（在等确认 / 回答时不重开，下一句再换）。
   - `continuing`（0.1.2，Friday 2.97.26 起）：`true` = 这句是 Friday 自己接着做的话（出错后自动恢复、点了重试、换了模型接着做），不是用户说的：
     还在等的提问 / 确认不拿它当回答，那一行再发一次 `waiting`、正文同第一次问时，这次回答到此结束（claude 那边照旧停着等）。
-- 流式输出：主智能体的文字 → `content`；思考 → `reasoning_content`（只在有字时：现在的模型思考块是空的）；最后一块带 `usage`
+- 流式输出：主智能体的文字 → `content`；思考 → `reasoning_content`（只在有字时：0.2.0 起拉起时带隐藏参数 `--thinking-display summarized`，
+  思考块里是摘要；不带时无头模式默认 `omitted`，只有签名、没有字）；最后一块带 `usage`
   （`prompt_tokens` = 最后一次调用的 input + cache_read + cache_creation，`completion_tokens` = 各轮 output 相加），
   和顶层 `x_friday.rateLimit`（最近的 `rate_limit_info`，Friday 不认就忽略）。
   一轮里没经模型（本地 / 命令之类）时把 `result` 里的文字当正文。
@@ -104,9 +109,13 @@ stdin 关了就停掉所有 claude 再退出。
 
 ```
 claude -p --input-format stream-json --output-format stream-json --include-partial-messages --verbose --forward-subagent-text
-       [--model <m>] --permission-mode <mode> --mcp-config <data-dir>/mcp/<key>.json --permission-prompt-tool mcp__friday__approve
+       [--model <m>] [--effort <档>] [--thinking-display summarized] --permission-mode <mode>
+       --mcp-config <data-dir>/mcp/<key>.json --permission-prompt-tool mcp__friday__approve
        [--resume <会话 id>]
 ```
+
+`--effort`、`--thinking-display` 是后来才有的参数（后者不在 `--help` 里）：每个 claude（按程序路径和修改时间）探一次——关着输入跑
+`claude -p … --effort high --thinking-display summarized`，认得的 1 秒内正常退出，不认的立刻报 `unknown option '--x'`，去掉再试；不认的就不带。
 
 当前目录 = 对话的工作目录。每句话往 stdin 写一行
 `{"type":"user","uuid":"<随机 UUID>","message":{"role":"user","content":[{"type":"text",…},{"type":"image",…}]}}`。

@@ -77,11 +77,26 @@ def build(previous: Path, out: Path, dist: Path, tag: str, repo: str, power: str
     return expected
 
 
+def drop(previous: Path, out: Path, power: str):
+    """不再提供的 Power：从两份索引里去掉（已经装了的 Friday 那边自己处理），写到 out；返回 {kind: "dropped", id}"""
+    old = load(previous / "index.json") or {"schema": 1, "powers": []}
+    new = load(previous / "index-v2.json") or {"schema": 2, "powers": list(old.get("powers", []))}
+    for index in (old, new):
+        index["powers"] = [p for p in index.get("powers", []) if p.get("id") != power]
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "index-v2.json").write_text(json.dumps(new, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    (out / "index.json").write_text(json.dumps(old, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"两份索引里去掉了 {power}")
+    return {"kind": "dropped", "id": power}
+
+
 def contains(index_path: Path, expected) -> bool:
     """索引里有这一项（版本也对）"""
     index = load(index_path)
     if not index:
         return False
+    if expected["kind"] == "dropped":
+        return not any(p.get("id") == expected["id"] for p in index.get("powers", []))
     if expected["kind"] == "runtime":
         return index.get("runtimes", {}).get(expected["id"], {}).get("version") == expected["version"]
     return any(p.get("id") == expected["id"] and p.get("version") == expected["version"] for p in index.get("powers", []))

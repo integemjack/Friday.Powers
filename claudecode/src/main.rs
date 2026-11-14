@@ -119,11 +119,13 @@ fn serve(args: &[String]) {
             std::process::exit(0);
         });
     }
-    // 先在后台把 claude 的路径、版本、登录状态查好（第一个 /v1/models 就不用等）
+    // 先在后台把 claude 的路径、版本、登录状态、认哪些参数、模型查好（第一个 /v1/models、第一段对话就不用等）
     std::thread::spawn(|| {
         if let Some(bin) = backend::find_binary() {
             let _ = backend::version(&bin);
             let _ = backend::auth(&bin);
+            let _ = backend::flags(&bin);
+            let _ = backend::models(&bin);
         }
     });
     std::thread::spawn(conv::reaper);
@@ -154,32 +156,50 @@ fn info() -> Value {
     })
 }
 
-/// 模型列表是固定的：订阅能用哪些模型没有接口可查，列 Claude Code 认的别名（default = 不传 --model，用 Claude Code 自己的默认）
-fn models() -> Result<Value, String> {
-    let bin = backend::find_binary().ok_or(backend::NOT_FOUND)?;
+/// 模型列表不写死：问 Claude Code 自己（backend::models，initialize 回的 models），它更新了新模型、换了默认这里跟着变。
+/// 每个模型：id = --model 的值（default 不传 --model，用 Claude Code 自己的默认）、name、description（Claude Code 的说明）、
+/// resolved_model（default 这类别名现在指哪个）、efforts（能选的思考档 = --effort 的值；空 = 不分档，只能开 / 关思考）
+fn models() -> Result<Value, (u16, String)> {
+    let bin = backend::find_binary().ok_or((503, backend::NOT_FOUND.to_string()))?;
     let version = backend::version(&bin).unwrap_or_default();
     let auth = backend::auth(&bin);
     let logged_in = auth.as_ref().map(|a| a["loggedIn"].as_bool() == Some(true)).unwrap_or(false);
     let plan = auth.as_ref().map(|a| a["authMethod"].as_str() == Some("claude.ai")).unwrap_or(false);
-    let data: Vec<Value> = [("default", "默认"), ("fable", "Fable"), ("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")]
-        .iter()
-        .map(|(id, name)| {
-            json!({
-                "id": id,
-                "object": "model",
-                "owned_by": "claudecode",
-                "name": name,
-                "input_modalities": ["text", "image"],
-                "tools": true,
-                "free": false,
-                "billing": if plan { "plan" } else { "metered" },
-            })
-        })
-        .collect();
+    let (list, stale) = backend::models(&bin).map_err(|e| (502, e))?;
+    let data: Vec<Value> = list.iter().filter_map(|m| model_entry(m, plan)).collect();
+    let mut detail = backend::detail(&version, auth.as_ref());
+    if stale {
+        detail.push_str(" · 模型列表是上次取到的");
+    }
     Ok(json!({
         "object": "list",
         "data": data,
-        "backend": { "detail": backend::detail(&version, auth.as_ref()), "version": version, "loggedIn": logged_in, "path": bin.to_string_lossy() },
+        "backend": { "detail": detail, "version": version, "loggedIn": logged_in, "path": bin.to_string_lossy(), "stale": stale },
+    }))
+}
+
+/// Claude Code 报的一个模型 → /v1/models 的一项
+fn model_entry(m: &Value, plan: bool) -> Option<Value> {
+    let id = m["value"].as_str().map(str::trim).filter(|s| !s.is_empty())?;
+    let name = if id == "default" { "默认" } else { m["displayName"].as_str().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(id) };
+    let efforts: Vec<&str> = if m["supportsEffort"].as_bool() == Some(true) {
+        m["supportedEffortLevels"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|l| conv::is_word(l)).collect()
+    } else {
+        Vec::new()
+    };
+    Some(json!({
+        "id": id,
+        "object": "model",
+        "owned_by": "claudecode",
+        "name": name,
+        "description": m["description"].as_str().unwrap_or(""),
+        "resolved_model": m["resolvedModel"].as_str().unwrap_or(""),
+        "efforts": efforts,
+        "adaptive_thinking": m["supportsAdaptiveThinking"].as_bool().unwrap_or(false),
+        "input_modalities": ["text", "image"],
+        "tools": true,
+        "free": false,
+        "billing": if plan { "plan" } else { "metered" },
     }))
 }
 
@@ -216,8 +236,9 @@ fn handle(mut stream: TcpStream, token: &str) {
             Ok(v) => {
                 let _ = http::json(&mut stream, 200, &v);
             }
-            Err(e) => {
-                let _ = http::error(&mut stream, 503, "claude_not_installed", &e, &[]);
+            Err((status, e)) => {
+                let code = if status == 503 { "claude_not_installed" } else { "claude_error" };
+                let _ = http::error(&mut stream, status, code, &e, &[]);
             }
         },
         ("POST", "/v1/chat/completions") => chat::handle(&req, &mut stream),

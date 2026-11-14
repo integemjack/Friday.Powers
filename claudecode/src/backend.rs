@@ -3,14 +3,18 @@
 //! 版本看 `claude --version`；登录状态只看 `claude auth status` 自己打印的 JSON，而且只留 loggedIn / authMethod / apiProvider / subscriptionType
 //! 四项（邮箱、组织 id 等一概不留）。本程序**不读、不碰** Claude Code 的登录凭据（钥匙串、~/.claude/.credentials.json、OAuth 令牌）。
 //! 拉起 claude 时继承本程序的环境，但去掉从上层 Claude Code 会话漏下来的 CLAUDECODE、CLAUDE_CODE_* 等（带着它们 claude 会认错登录）。
+//! 模型列表不写死：问 claude 自己（流式输入的 initialize 控制请求，见 models()），Claude Code 更新出了新模型、换了默认，这里跟着变。
 
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::channel;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
+
+use crate::store;
 
 struct State {
     data_dir: PathBuf,
@@ -21,12 +25,24 @@ struct State {
     version: Option<(PathBuf, Option<std::time::SystemTime>, String)>,
     /// claude auth status 的缓存（60 秒）
     auth: Option<(Instant, Value)>,
+    /// claude 认不认后来加的参数：（程序路径, 修改时间）→ Flags
+    flags: Option<(PathBuf, Option<SystemTime>, Flags)>,
+    /// Claude Code 报的模型（60 秒）：（程序路径, 修改时间, 取到的时候, 模型）
+    models: Option<(PathBuf, Option<SystemTime>, Instant, Vec<Value>)>,
 }
 
 fn state() -> &'static Mutex<State> {
     static S: OnceLock<Mutex<State>> = OnceLock::new();
     S.get_or_init(|| {
-        Mutex::new(State { data_dir: PathBuf::from("."), server: String::new(), internal_token: String::new(), version: None, auth: None })
+        Mutex::new(State {
+            data_dir: PathBuf::from("."),
+            server: String::new(),
+            internal_token: String::new(),
+            version: None,
+            auth: None,
+            flags: None,
+            models: None,
+        })
     })
 }
 
@@ -167,6 +183,10 @@ fn run_quick(mut cmd: Command, secs: u64) -> Option<String> {
     reader.join().ok()
 }
 
+fn mtime(bin: &Path) -> Option<SystemTime> {
+    std::fs::metadata(bin).and_then(|m| m.modified()).ok()
+}
+
 /// `claude --version` → "2.1.276"（按程序路径和修改时间缓存）
 pub fn version(bin: &Path) -> Option<String> {
     let mtime = std::fs::metadata(bin).and_then(|m| m.modified()).ok();
@@ -210,6 +230,190 @@ pub fn auth(bin: &Path) -> Option<Value> {
 /// 登录过期 / 出错后丢掉缓存，下次重查
 pub fn forget_auth() {
     state().lock().unwrap().auth = None;
+}
+
+/// claude 认不认这几个后来才有的参数（老版本没有；--thinking-display 不在 --help 里）
+#[derive(Clone, Copy, Debug)]
+pub struct Flags {
+    /// --effort low|medium|high|xhigh|max（思考档）
+    pub effort: bool,
+    /// --thinking-display summarized（无头模式默认 omitted：思考只有签名、没有字）
+    pub display: bool,
+}
+
+/// 探一次：关着输入跑 `claude -p … <参数>`——认得的 1 秒内正常退出（没话可答），不认的立刻报 `unknown option '--x'`，去掉它再试。
+/// 按程序路径和修改时间缓存（Claude Code 更新了重探）；探不出结果（超时、起不来）当都认，不缓存
+pub fn flags(bin: &Path) -> Flags {
+    let mtime = mtime(bin);
+    if let Some((p, t, f)) = &state().lock().unwrap().flags {
+        if p == bin && *t == mtime {
+            return *f;
+        }
+    }
+    let mut f = Flags { effort: true, display: true };
+    for _ in 0..3 {
+        let mut cmd = command(bin);
+        cmd.args(QUIET);
+        if f.effort {
+            cmd.args(["--effort", "high"]);
+        }
+        if f.display {
+            cmd.args(["--thinking-display", "summarized"]);
+        }
+        cmd.current_dir(work_dir());
+        let Some((_, err)) = run_capture(cmd, 20) else { return f };
+        if f.effort && err.contains("unknown option '--effort'") {
+            f.effort = false;
+        } else if f.display && err.contains("unknown option '--thinking-display'") {
+            f.display = false;
+        } else {
+            break;
+        }
+    }
+    log(&format!("claude 参数：--effort {} --thinking-display {}", f.effort, f.display));
+    state().lock().unwrap().flags = Some((bin.to_path_buf(), mtime, f));
+    f
+}
+
+/// 只起 claude 不干活时的参数：不留会话、不要工具、不加载用户的 MCP 服务
+const QUIET: [&str; 11] = [
+    "-p",
+    "--input-format",
+    "stream-json",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--no-session-persistence",
+    "--tools",
+    "",
+    "--strict-mcp-config",
+    "--include-partial-messages",
+];
+
+/// 没给工作目录时 claude 在这里跑（<data-dir>/work）
+pub fn work_dir() -> PathBuf {
+    let dir = data_dir().join("work");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// 跑一个命令，关着输入，最多等 secs 秒：（正常退出了没有, stderr）；超时、起不来返回 None
+fn run_capture(mut cmd: Command, secs: u64) -> Option<(bool, String)> {
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().ok()?;
+    let mut stderr = child.stderr.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stderr.read_to_string(&mut s);
+        s
+    });
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    Some((status.success(), reader.join().ok().unwrap_or_default()))
+}
+
+/// Claude Code 自己报的模型：流式输入的 initialize 控制请求（Agent SDK 的 supportedModels() 就是它）回的 models——
+/// [{value（--model 的值：default / opus[1m] / sonnet / haiku / 完整模型名…）, displayName, description, resolvedModel,
+///   supportsEffort, supportedEffortLevels（low … max）, supportsAdaptiveThinking, …}]，跟着装的 Claude Code 版本和登录的账号变。
+/// 60 秒内用缓存；取到的存进 <data-dir>/models.json，取不到（claude 起不来、超时）时用存下的，第二项为 true
+pub fn models(bin: &Path) -> Result<(Vec<Value>, bool), String> {
+    let mtime = mtime(bin);
+    if let Some((p, t, at, list)) = &state().lock().unwrap().models {
+        if p == bin && *t == mtime && at.elapsed() < Duration::from_secs(60) {
+            return Ok((list.clone(), false));
+        }
+    }
+    let saved = data_dir().join("models.json");
+    match ask_models(bin) {
+        Ok(list) => {
+            state().lock().unwrap().models = Some((bin.to_path_buf(), mtime, Instant::now(), list.clone()));
+            let _ = std::fs::write(&saved, json!({ "at": store::now(), "models": list }).to_string());
+            Ok((list, false))
+        }
+        Err(e) => {
+            log(&format!("问 Claude Code 要模型失败：{e}"));
+            let old = std::fs::read_to_string(&saved).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok());
+            match old.and_then(|v| v["models"].as_array().cloned()).filter(|l| !l.is_empty()) {
+                Some(list) => Ok((list, true)),
+                None => Err(format!("问 Claude Code 要模型列表失败：{e}")),
+            }
+        }
+    }
+}
+
+fn ask_models(bin: &Path) -> Result<Vec<Value>, String> {
+    let mut cmd = command(bin);
+    cmd.args(QUIET).current_dir(work_dir()).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("拉起 {} 失败：{e}", bin.display()))?;
+    let mut stdin = child.stdin.take().ok_or("没有 stdin")?;
+    let stdout = child.stdout.take().ok_or("没有 stdout")?;
+    let mut stderr = child.stderr.take().ok_or("没有 stderr")?;
+    let err_reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stderr.read_to_string(&mut s);
+        s
+    });
+    let (tx, rx) = channel::<Value>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(v) = serde_json::from_str::<Value>(line.trim()) {
+                if tx.send(v).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    let request = json!({ "type": "control_request", "request_id": "friday-models", "request": { "subtype": "initialize" } });
+    let wrote = writeln!(stdin, "{request}").and_then(|_| stdin.flush());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut answer: Result<Vec<Value>, String> = Err("Claude Code 没有回 initialize".into());
+    if let Err(e) = wrote {
+        answer = Err(format!("写不进 claude：{e}"));
+    } else {
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                answer = Err("等 Claude Code 回 initialize 超时（30 秒）".into());
+                break;
+            }
+            let Ok(v) = rx.recv_timeout(left.min(Duration::from_millis(500))) else {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    break;
+                }
+                continue;
+            };
+            if v["type"].as_str() != Some("control_response") || v["response"]["request_id"].as_str() != Some("friday-models") {
+                continue;
+            }
+            let r = &v["response"];
+            answer = if r["subtype"].as_str() == Some("success") {
+                match r["response"]["models"].as_array() {
+                    Some(list) if !list.is_empty() => Ok(list.clone()),
+                    _ => Err("Claude Code 没报模型".into()),
+                }
+            } else {
+                Err(r["error"].as_str().unwrap_or("Claude Code 回了出错").to_string())
+            };
+            break;
+        }
+    }
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    let err = err_reader.join().unwrap_or_default();
+    answer.map_err(|e| match err.lines().map(str::trim).rfind(|l| !l.is_empty()) {
+        Some(last) => format!("{e}（{}）", last.chars().take(200).collect::<String>()),
+        None => e,
+    })
 }
 
 /// 给人看的一句：「Claude Code 2.1.276 · Max 订阅」/「未登录：在终端运行 claude auth login」

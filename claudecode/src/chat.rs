@@ -8,6 +8,8 @@
 //!   permission  Friday 会话框下的权限档：auto（默认：改工作目录里的文件不问，跑命令等先问）| plan（只读）| full（都不问）
 //!   toolEvents  Friday 认结构化的工具事件（x_friday.tool）
 //!   questions   Friday 把等回答的提问行（AskUserQuestion）画成选项卡片（v2.97.25 起）：提问时正文不再列一遍问题
+//!   thinking    思考档：off（不想）| on（想、不指定档）| low / medium / high / xhigh / max…（--effort，按 /v1/models 里这个模型的 efforts）；
+//!               没有 = 用 Claude Code 自己的设置。换了档（和模型、权限档一样）重开 claude 接着这个会话
 //!   continuing  这句是 Friday 自己接着做的话（出错后自动恢复、点了重试、换了模型接着做），不是用户说的：
 //!               还在等的提问 / 确认不拿它当回答，原样再交回去（工具行再标一次等回答，这次到此为止）
 //! 要用户确认的操作：这次回答以一句说明结束，claude 那边停着等；用户下一句说「允许」/「总是允许」就放行并接着把后面的内容流回来，
@@ -28,8 +30,11 @@ use crate::http::{self, Request, Sse};
 use crate::store;
 
 struct Ask {
-    /// 请求里的模型 id：default（不传 --model）/ fable / opus / sonnet / haiku（也认 Claude Code 认的完整模型名）
+    /// 请求里的模型 id：/v1/models 报的（Claude Code 自己报的 value：default（不传 --model）/ opus[1m] / sonnet / haiku…），
+    /// 也认 Claude Code 认的别名、完整模型名
     model: String,
+    /// 思考档（x_friday.thinking）：空 / off / on / --effort 的值
+    thinking: String,
     /// 这段对话的 key（session + 工作目录的哈希）；一次性请求为空
     key: String,
     dir: String,
@@ -148,6 +153,7 @@ fn parse(body: &Value) -> Result<Ask, String> {
     let tool_events = xf["toolEvents"].as_bool().unwrap_or(false);
     let questions = xf["questions"].as_bool().unwrap_or(false);
     let continuing = xf["continuing"].as_bool().unwrap_or(false);
+    let thinking = xf["thinking"].as_str().map(|t| t.trim().to_lowercase()).filter(|t| conv::is_word(t)).unwrap_or_default();
     let messages: Vec<Value> = body["messages"].as_array().cloned().unwrap_or_default();
     let Some(last_user) = messages.iter().rposition(|m| m["role"].as_str() == Some("user")) else {
         return Err("messages 里没有用户的话".into());
@@ -189,7 +195,7 @@ fn parse(body: &Value) -> Result<Ask, String> {
     if text.trim().is_empty() && images.is_empty() {
         return Err("最后一句用户的话是空的".into());
     }
-    Ok(Ask { model, key, dir, permission, text, said, images, history, tool_events, questions, continuing })
+    Ok(Ask { model, thinking, key, dir, permission, text, said, images, history, tool_events, questions, continuing })
 }
 
 fn content(text: &str, images: &[Value]) -> Value {
@@ -591,7 +597,7 @@ pub fn handle(req: &Request, stream: &mut TcpStream) {
 fn oneshot(bin: &Path, ask: &Ask, out: &mut Out) -> Pumped {
     let conv = Conv::new("oneshot", &ask.dir, true);
     let mut p = conv.proc.lock().unwrap();
-    if let Err(e) = conv.spawn(&mut p, bin, &ask.model, "default", None) {
+    if let Err(e) = conv.spawn(&mut p, bin, &ask.model, "default", &ask.thinking, None) {
         return Pumped::failed(502, "claude_error", e);
     }
     backend::log(&format!("oneshot model={} said={:?}", ask.model, cut(&ask.said, 40)));
@@ -605,11 +611,14 @@ fn oneshot(bin: &Path, ask: &Ask, out: &mut Out) -> Pumped {
     r
 }
 
-/// 没在跑 / 模型或权限档变了：（重新）拉起，能接回的用 --resume
+/// 没在跑 / 模型、权限档或思考档变了：（重新）拉起，能接回的用 --resume
 fn ensure(conv: &Conv, p: &mut Proc, bin: &Path, ask: &Ask) -> Result<(), String> {
     let mode = conv::claude_mode(&ask.permission);
-    if conv.alive(p) && (p.model != ask.model || p.mode != mode) {
-        let why = format!("换了模型 / 权限档（{} {} → {} {}），重开", p.model, p.mode, ask.model, mode);
+    if conv.alive(p) && (p.model != ask.model || p.mode != mode || p.thinking != ask.thinking) {
+        let why = format!(
+            "换了模型 / 权限档 / 思考档（{} {} {} → {} {} {}），重开",
+            p.model, p.mode, p.thinking, ask.model, mode, ask.thinking
+        );
         conv.stop(p, &why);
     }
     if !conv.alive(p) {
@@ -619,7 +628,7 @@ fn ensure(conv: &Conv, p: &mut Proc, bin: &Path, ask: &Ask) -> Result<(), String
         } else {
             store::get(&ask.key).filter(|e| e.dir == ask.dir).map(|e| e.session)
         };
-        conv.spawn(p, bin, &ask.model, mode, resume.as_deref())?;
+        conv.spawn(p, bin, &ask.model, mode, &ask.thinking, resume.as_deref())?;
     }
     Ok(())
 }

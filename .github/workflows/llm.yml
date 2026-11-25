@@ -137,7 +137,8 @@ jobs:
         with:
           cuda: '13.0.0'
           method: network
-          sub-packages: '["nvcc", "cudart", "cudart-dev", "cccl", "nvprune"]'
+          # nvml-dev：llama.cpp b12xxx 的 ggml-cuda 要 nvml.h（运行时才动态加载 NVML，只要头文件）
+          sub-packages: '["nvcc", "cudart", "cudart-dev", "cccl", "nvprune", "nvml-dev"]'
           non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
           log-file-suffix: '${{ matrix.target }}.txt'
       - name: 编译

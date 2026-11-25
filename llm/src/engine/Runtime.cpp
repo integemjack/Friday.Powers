@@ -229,12 +229,13 @@ json errorJson(int seq, const std::string& message)
 
 /// llama.cpp 的系统配置文件（%PROGRAMDATA%\llama.cpp\config.ini 或 /etc/llama.cpp/config.ini、用户配置目录里的 config.ini）：
 /// common_params_parse 会读它们（== llama-server），格式或值不对时抛的不是 invalid_argument → exit(1)。
-/// 照 common_params_apply_system_config（common/arg.cpp:719-760）先在草稿参数上读一遍，读不了就报错，不让进程退出
+/// 照 common_params_apply_system_config（b12708 common/arg.cpp:738-770）先在草稿参数上读一遍，读不了就报错，不让进程退出
 bool checkSystemConfig(std::string* error)
 {
     std::vector<std::filesystem::path> paths;
 #if defined(_WIN32)
-    const std::filesystem::path programData = common_get_path_from_env("PROGRAMDATA");
+    // b12708 去掉了 common_get_path_from_env，common 自己改用 common_get_env（std::getenv）：取同一个路径
+    const std::filesystem::path programData = common_get_env("PROGRAMDATA");
     if (!programData.empty())
         paths.push_back(programData / "llama.cpp" / "config.ini");
 #else

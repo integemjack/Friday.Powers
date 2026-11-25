@@ -67,6 +67,13 @@ Friday 的预留 = 生图 / 生视频模型文件的大小（主模型 + VAE + �
 - `priority`：排队时大的先（主智能体 1000，子智能体用层数，旁路请求放中间）。
 - `main`：主智能体的对话。KV 池满时最后腾它。
 
+思考（0.3 起同 llama-server b12708）：顶层的 `enable_thinking`（Friday 的本地引擎这样发）或 `chat_template_kwargs.enable_thinking`
+开关思考；`reasoning_effort` 选档，`none` = 关，模板认 `none` 这一档时照样交给模板，模板会报错的档回 400。
+模板不看 `enable_thinking`、只认 `reasoning_effort` 的（Inkling 2、gpt-oss 一类，加载时同一句话开 / 关各渲染一次比出来）：
+关思考又没给档时自动补 `reasoning_effort: none`（Inkling 2 渲染成「Thinking effort level: 0」：想得少，但模型仍会先想一小段，
+模板没有跳过思考的写法，llama-server 也一样；实测 Mini 算 17×23，缺省 0.9 档想 454 字、0 档 220 字）。
+模板认哪些档在 `/v1/info` 的 `model.loaded.reasoning_effort_levels`（低到高）。
+
 ## 3. 返回
 
 和 llama-server 一样（`usage.prompt_tokens_details.cached_tokens`、`timings`）。另外：

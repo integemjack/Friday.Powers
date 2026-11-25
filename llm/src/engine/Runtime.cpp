@@ -361,6 +361,28 @@ bool prepareArguments(const std::vector<std::string>& args, std::vector<std::str
     return true;
 }
 
+/// 模板理不理 enable_thinking：同一句用户话开 / 关各渲染一次，一样就是不理（Inkling 2、gpt-oss 这类只认 reasoning_effort 的）
+static bool templateIgnoresEnableThinking(const common_chat_templates* templates)
+{
+    try {
+        const auto render = [templates](bool on) {
+            common_chat_templates_inputs inputs;
+            common_chat_msg message;
+            message.role = "user";
+            message.content = "test";
+            inputs.messages = { message };
+            inputs.add_generation_prompt = true;
+            inputs.use_jinja = true;
+            inputs.enable_thinking = on;
+            inputs.chat_template_kwargs["enable_thinking"] = on ? "true" : "false";
+            return common_chat_templates_apply(templates, inputs).prompt.str();
+        };
+        return render(true) == render(false);
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 std::string guessMemoryKind(const std::string& ggufPath)
 {
     gguf_init_params init {};
@@ -430,10 +452,12 @@ static bool measureDevices(const common_params& params, uint32_t nCtx, int nSeqM
         cparams.n_batch = std::max(cparams.n_batch, cparams.n_seq_max);
         cparams.n_outputs_max = std::min(cparams.n_batch, std::max(cparams.n_outputs_max, cparams.n_seq_max));
         uint32_t layers = 0;
+        uint32_t layersSkip = 0;
         uint32_t experts = 0;
         devices.clear();
-        const common_device_memory_data_vec data = common_get_device_memory_data(params.model.path.c_str(), &mparams, &cparams, devices,
-                                                                                 layers, nCtxTrain, experts, GGML_LOG_LEVEL_ERROR);
+        const common_device_memory_data_vec data = common_get_device_memory_data(params.model.get_paths(), &mparams, &cparams, devices,
+                                                                                 layers, layersSkip, nCtxTrain, experts,
+                                                                                 GGML_LOG_LEVEL_ERROR);
         silenceCommonLog();
         used.clear();
         free.clear();
@@ -680,7 +704,26 @@ std::unique_ptr<Runtime> Runtime::load(const LoadOptions& options, flr_progress_
     }
     if (!runtime->m_templates)
         return fail(FLR_INVALID_REQUEST, "聊天模板解析失败");
-    runtime->m_caps = common_chat_templates_get_caps(runtime->m_templates.get());
+    // b12xxx 起 caps 是 JSON：布尔项之外带模板认的思考档（Inkling 2 这类只认 reasoning_effort、不认 enable_thinking 的模板靠它关思考）
+    {
+        const common_json caps = common_chat_templates_get_caps(runtime->m_templates.get());
+        for (const auto& item : caps.items()) {
+            if (item.value().is_boolean())
+                runtime->m_caps[item.key()] = item.value().get<bool>();
+        }
+        const auto strings = [&caps](const char* key) {
+            std::vector<std::string> out;
+            if (caps.contains(key) && caps.at(key).is_array()) {
+                for (const auto& value : caps.at(key)) {
+                    if (value.is_string())
+                        out.push_back(value.get<std::string>());
+                }
+            }
+            return out;
+        };
+        runtime->m_effortLevels = strings("reasoning_effort_levels");
+        runtime->m_effortRejected = strings("reasoning_effort_rejected");
+    }
     runtime->m_supportsThinking = params.use_jinja && common_chat_templates_support_enable_thinking(runtime->m_templates.get());
 
     // MARK: 尺寸
@@ -717,6 +760,13 @@ std::unique_ptr<Runtime> Runtime::load(const LoadOptions& options, flr_progress_
     environment.vocab = runtime->m_vocab;
     environment.templates = runtime->m_templates.get();
     environment.caps = runtime->m_caps;
+    environment.effortLevels = runtime->m_effortLevels;
+    environment.effortRejected = runtime->m_effortRejected;
+    if (std::find(runtime->m_effortLevels.begin(), runtime->m_effortLevels.end(), "none") != runtime->m_effortLevels.end()
+        && templateIgnoresEnableThinking(runtime->m_templates.get())) {
+        environment.thinkingOffEffort = "none";
+        logf(FLR_LOG_NOTICE, "模板不看 enable_thinking，关思考时用 reasoning_effort=none");
+    }
     environment.useJinja = params.use_jinja;
     environment.prefillAssistant = params.prefill_assistant;
     environment.enableThinking = params.enable_reasoning != 0 && runtime->m_supportsThinking;
@@ -829,6 +879,7 @@ json Runtime::info() const
         { "seq_rm", seqRmName(m_seqRm) },
         { "supports_thinking", m_supportsThinking },
         { "template_caps", caps },
+        { "reasoning_effort_levels", m_effortLevels },
         { "kv_bytes_per_token", m_kvBytesPerToken },
         { "state_bytes_per_seq", m_stateBytesPerSeq },
         { "n_batch", m_nBatch },

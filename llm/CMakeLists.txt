@@ -7,7 +7,7 @@
 #   cmake -B build -G Ninja -DLLM_CUDA=ON          # 或 -DLLM_VULKAN=ON / -DLLM_METAL=ON
 #   cmake --build build                             # 产物 build/bin/friday-llm
 cmake_minimum_required(VERSION 3.24)
-project(friday-llm VERSION 0.2.0 LANGUAGES C CXX)
+project(friday-llm VERSION 0.3.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -60,7 +60,7 @@ set(LLAMA_BUILD_IS_DEV     OFF CACHE BOOL "" FORCE)
 
 include(FetchContent)
 # llama.cpp 的版本（换版本时同时改 src/engine 里照着 server 写的那几处，见 docs/llm-design.md §2）
-set(LLM_LLAMA_TAG b11541)
+set(LLM_LLAMA_TAG b12708)
 FetchContent_Declare(llama
     URL https://github.com/ggml-org/llama.cpp/archive/refs/tags/${LLM_LLAMA_TAG}.tar.gz
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE)

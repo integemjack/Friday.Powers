@@ -15,10 +15,23 @@ llama-server（b11541）有多槽位、连续批处理、统一 KV、每个槽�
 
 ## 2. llama.cpp 的版本
 
-`CMakeLists.txt` 的 `LLM_LLAMA_TAG`（现在 b11541）。照着 server 写的几处（换版本时对一遍）：
+`CMakeLists.txt` 的 `LLM_LLAMA_TAG`（现在 b12708，0.3 起；0.1–0.2 是 b11541）。照着 server 写的几处（换版本时对一遍）：
 `ChatFormat::prepare` ↔ `server-common.cpp` 的 `oaicompat_chat_params_parse` 与 `server-schema.cpp` 的采样字段；
 `ChatStream` ↔ `server-task.cpp` 的 `task_result_state::update_chat_msg`、`to_json_oaicompat_chat*`；
 `Scheduler` ↔ `server-context.cpp` 的 `update_slots` / `process_token`；`Runtime::load` ↔ `server.cpp` 的 `main` / `load_model`。
+
+b11541 → b12708（0.3，为了 Inkling 2：`inkling2` / Mini 的 `inkling2_loop`，b12406 起支持、b12622 修正确性、11-23 改进工具调用解析）
+对过的差别：渲染结果从字符串改成按模板文字 / 用户输入分段的 `common_chat_prompt`（server 照样 `.str()` 拼成一段再分词，这里同它）；
+`common_chat_templates_get_caps` 改返回 JSON，多了模板认的思考档 `reasoning_effort_levels` / 会报错的 `reasoning_effort_rejected`
+（`reasoning_effort` 的处理照 server 改，另外模板不看 `enable_thinking` 时关思考补 `none`，见 llm-protocol.md §2）；
+`common_get_device_memory_data` 收模型路径数组、多一个 `hp_ngl_skip`；采样的 `dry_sequence_breakers` 先去重、最多 64 个；
+`response_format` 的 `json_schema` 可以不包一层。`update_chat_msg`、流式输出、`process_token` 没变；`update_slots` 只多了
+TTS / 实时语音的槽位，与这里无关。server 的检查点复用改成了 `get_reuse`（循环 / 混合模型按 0 窗口算），这里本来就只在检查点分叉。
+
+Inkling 2 是「混合 + 滑窗」：每层既有短卷积（`shortconv`，固定大小的循环状态）又有注意力，注意力 5 层滑窗（1024）1 层全注意力，
+还有按距离的相对位置偏置（新的 `hybrid_iswa_rel` 内存）。`guessMemoryKind` 按 `.shortconv.` 认成 hybrid，`seq_rm` 是 full，
+走 §3.3 的检查点分叉；Mini 的 6–18 层循环 3 遍、每遍各有一份 KV 和卷积状态（48 个缓存层），这些都在 llama.cpp 里，调度器不用管。
+Mini 是 MoE（128 选 8），按 §「MoE 上下文下限」保 128K：16 GB 的 M1 上 Q2_K_XL 放不下 128K，专家挪到内存后只有 0.7 tok/s。
 
 ## 3. 基数树
 
@@ -108,4 +121,4 @@ RTX PRO 6000（96 GB），Qwen3.6-35B-A3B（混合 MoE，NVFP4 的 Q4_K_M GGUF�
 ## 5. 以后
 
 - 落盘一层：被腾掉的会话序列按回合边界存到 `<数据目录>/kv/`（v1 的 `StateFile`，已经编进来了），同一会话再来时先读回来；
-- 投机解码：b11541 有 `draft-mtp` / `draft-eagle3` / `ngram-*`，带 MTP 头的模型（Qwen3.5 MTP 版）可以直接用。
+- 投机解码：b12708 有 `draft-mtp` / `draft-eagle3` / `ngram-*` 和 Inkling 2 的 DSpark（仓库里的 `dspark-*.gguf`），带 MTP 头的模型（Qwen3.5 MTP 版）可以直接用。

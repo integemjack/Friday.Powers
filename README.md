@@ -60,7 +60,7 @@ python voice/tools/speak_test.py  --url ws://127.0.0.1:端口/v1/realtime/speak 
 
 ## 第二个 Power：`llm`（本地大模型，v2.7）
 
-- llama.cpp（b11541）+ 自己的调度器：连续批处理，同时算好几个请求（`--parallel`；0.2 起缺省按显存定，最多 8 个，
+- llama.cpp（0.3 起 b12708，支持 Inkling 2；之前 b11541）+ 自己的调度器：连续批处理，同时算好几个请求（`--parallel`；0.2 起缺省按显存定，最多 8 个，
   也可以在 Friday 的「设置 › 能力」里选）；0.2 起按显存多缓存会话、放大 KV 池，池子不够时新请求先排队（KV 余量放行），
   见 [docs/llm-design.md](docs/llm-design.md) §4；
 - **基数树前缀共享**：所有序列的账本建成一棵基数树，统一 KV 池里共用前缀的格子只存一份（`llama_memory_seq_cp` 只改元数据）。

@@ -95,6 +95,9 @@ private:
 
     common_context_seq_rm_type m_seqRm = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     std::map<std::string, bool> m_caps;
+    /// 模板认的思考档（低到高，common 探测的 reasoning_effort_levels）与会报错的档（reasoning_effort_rejected）
+    std::vector<std::string> m_effortLevels;
+    std::vector<std::string> m_effortRejected;
     bool m_supportsThinking = false;
     std::string m_modelId;
     std::string m_modelPath;

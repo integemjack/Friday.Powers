@@ -209,10 +209,15 @@ int ChatFormat::prepare(json body, ChatRequest& out, std::string* error) const
                 if (responseFormat.contains("schema") || jsonSchema.empty())
                     jsonSchema = valueOr<json>(responseFormat, "schema", json::object());
             } else if (type == "json_schema") {
-                const json wrapper = valueOr<json>(responseFormat, "json_schema", json::object());
-                jsonSchema = valueOr<json>(wrapper, "schema", json::object());
+                // b12708：没有 json_schema 包一层时直接取 schema
+                if (responseFormat.contains("json_schema")) {
+                    const json wrapper = valueOr<json>(responseFormat, "json_schema", json::object());
+                    jsonSchema = valueOr<json>(wrapper, "schema", json::object());
+                } else {
+                    jsonSchema = valueOr<json>(responseFormat, "schema", json::object());
+                }
             } else if (!type.empty() && type != "text") {
-                throw std::invalid_argument("response_format type must be one of \"text\" or \"json_object\", but got: " + type);
+                throw std::invalid_argument("response_format type must be one of \"text\", \"json_object\" or \"json_schema\", but got: " + type);
             }
         }
         if (jsonSchema.is_object() && jsonSchema.empty())
@@ -307,21 +312,41 @@ int ChatFormat::prepare(json body, ChatRequest& out, std::string* error) const
             else if (!kwarg.empty() && kwarg[0] == '"')
                 throw std::invalid_argument("invalid type for \"enable_thinking\" (expected boolean, got string)");
         }
+        // 思考档（== server 的 oaicompat_chat_params_parse，b12708）：none 关思考，模板认 none 这一档时照样交给模板
+        // （有的模板靠 reasoning_effort=none 关思考，有的遇到 none 报错，看模板认哪些档）；模板会报错的档直接回参数错误
+        const auto hasLevel = [this](const std::string& level) {
+            return std::find(m_env.effortLevels.begin(), m_env.effortLevels.end(), level) != m_env.effortLevels.end();
+        };
         if (body.contains("reasoning_effort")) {
             const std::string effort = valueOr<std::string>(body, "reasoning_effort", std::string());
             if (effort == "none") {
                 inputs.enable_thinking = false;
-                inputs.chat_template_kwargs.erase("reasoning_effort");
+                if (hasLevel(effort))
+                    inputs.chat_template_kwargs["reasoning_effort"] = json(effort).dump();
+                else
+                    inputs.chat_template_kwargs.erase("reasoning_effort");
             } else if (!effort.empty()) {
+                if (std::find(m_env.effortRejected.begin(), m_env.effortRejected.end(), effort) != m_env.effortRejected.end()) {
+                    std::string levels;
+                    for (const std::string& level : m_env.effortLevels)
+                        levels += (levels.empty() ? "" : ", ") + level;
+                    throw std::invalid_argument("reasoning_effort \"" + effort + "\" is not supported by the chat template, supported levels: "
+                                                + levels);
+                }
                 inputs.chat_template_kwargs["reasoning_effort"] = json(effort).dump();
             }
         }
+        // Friday 的本地引擎只发 enable_thinking（开 / 关）。模板不看 enable_thinking、只认 reasoning_effort（Inkling 2 一类）时，
+        // 关思考又没给思考档就补上 reasoning_effort=none，不然关了照样按模板的缺省档想（thinkingOffEffort 加载时探好）
+        if (!inputs.enable_thinking && !m_env.thinkingOffEffort.empty() && !inputs.chat_template_kwargs.count("reasoning_effort"))
+            inputs.chat_template_kwargs["reasoning_effort"] = json(m_env.thinkingOffEffort).dump();
         inputs.force_pure_content = m_env.forcePureContent;
 
         common_chat_session_params sessionParams;
         sessionParams.echo = valueOr<bool>(body, "echo", false);
         out.chatSession = common_chat_session(m_env.templates, m_env.vocab, inputs, sessionParams);
-        p.prompt = out.chatSession.prompt();
+        // b12xxx 起渲染结果按模板文字 / 用户输入分段（common_chat_prompt）；server 照样拼成一段再分词，这里同它
+        p.prompt = out.chatSession.prompt().str();
         p.generation_prompt = out.chatSession.generation_prompt();
         const double t1 = double(ggml_time_us());
         p.t_template_ms = (t1 - t0) / 1000.0;
@@ -395,6 +420,17 @@ int ChatFormat::prepare(json body, ChatRequest& out, std::string* error) const
             sampling.dry_sequence_breakers = valueOr<std::vector<std::string>>(body, "dry_sequence_breakers", {});
             if (sampling.dry_sequence_breakers.empty())
                 throw std::invalid_argument(fieldError("dry_sequence_breakers", "Error: dry_sequence_breakers must be a non-empty array of strings"));
+            // == server-schema（b12708）：每个不同的断句符初始化采样器时要扫一遍词表，先去重再数
+            std::vector<std::string> unique;
+            for (const std::string& breaker : sampling.dry_sequence_breakers) {
+                if (std::find(unique.begin(), unique.end(), breaker) == unique.end())
+                    unique.push_back(breaker);
+            }
+            if (unique.size() > LLAMA_DRY_MAX_SEQ_BREAKERS)
+                throw std::invalid_argument(fieldError("dry_sequence_breakers", "Error: dry_sequence_breakers must contain at most "
+                                                                                     + std::to_string(LLAMA_DRY_MAX_SEQ_BREAKERS)
+                                                                                     + " distinct entries"));
+            sampling.dry_sequence_breakers = std::move(unique);
         }
         if (body.contains("samplers") && !body["samplers"].is_null()) {
             const json& samplers = body["samplers"];
@@ -567,7 +603,7 @@ int ChatFormat::prefixBoundary(const common_chat_templates_inputs& inputs, const
                 probeInputs.messages.push_back(std::move(user));
                 probeInputs.add_generation_prompt = false;
                 probeInputs.continue_final_message = COMMON_CHAT_CONTINUATION_NONE;
-                return tokenize(m_env.vocab, common_chat_templates_apply(m_env.templates, probeInputs).prompt);
+                return tokenize(m_env.vocab, common_chat_templates_apply(m_env.templates, probeInputs).prompt.str());
             };
             const std::vector<llama_token> first = probe("甲");
             const std::vector<llama_token> second = probe("乙");
@@ -621,7 +657,7 @@ int ChatFormat::transcriptBoundary(const common_chat_templates_inputs& inputs, c
             common_chat_templates_inputs headInputs = inputs;
             headInputs.add_generation_prompt = false;
             headInputs.continue_final_message = COMMON_CHAT_CONTINUATION_NONE;
-            head = common_chat_templates_apply(m_env.templates, headInputs).prompt;
+            head = common_chat_templates_apply(m_env.templates, headInputs).prompt.str();
         } catch (const std::exception&) {
             return -1;
         }

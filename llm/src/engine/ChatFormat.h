@@ -24,8 +24,13 @@ struct ChatEnvironment {
     const llama_model* model = nullptr;
     const llama_vocab* vocab = nullptr;
     const common_chat_templates* templates = nullptr;
-    /// common_chat_templates_get_caps
+    /// common_chat_templates_get_caps 的布尔项
     std::map<std::string, bool> caps;
+    /// 模板认的思考档（低到高）与会报错的档（caps 的 reasoning_effort_levels / reasoning_effort_rejected）
+    std::vector<std::string> effortLevels;
+    std::vector<std::string> effortRejected;
+    /// 关思考时补的 reasoning_effort：模板不看 enable_thinking、认 none 这一档时是 "none"（Inkling 2 一类），否则空
+    std::string thinkingOffEffort;
     bool useJinja = true;
     /// 结尾是 assistant 消息时接着它写（params.prefill_assistant）
     bool prefillAssistant = true;
